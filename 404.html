@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Animetsu</title>
+    <script>
+      // GitHub Pages SPA deep-link recovery.
+      // GitHub serves this file's CONTENT at whatever missing URL was requested,
+      // so we bounce to the app's directory and let index.html restore the route.
+      (function () {
+        try {
+          var prev = sessionStorage.getItem("animetsu_404_path");
+          var save, target;
+          if (prev) {
+            // second consecutive 404 -> heuristic prefix was wrong (user site).
+            // fall back to the domain root.
+            save = prev;
+            target = location.origin + "/";
+          } else {
+            save = location.pathname + location.search;
+            var seg = location.pathname.split("/").filter(Boolean)[0];
+            target = location.origin + "/" + (seg ? seg + "/" : "");
+          }
+          sessionStorage.setItem("animetsu_404_path", save);
+          location.replace(target);
+        } catch (e) {
+          location.replace(location.origin + "/");
+        }
+      })();
+    </script>
+  </head>
+  <body></body>
+</html>

@@ -1,0 +1,15 @@
+User-agent: *
+Allow: /
+Disallow: /api/
+Disallow: /v2/api/
+Disallow: /auth/
+Disallow: /v2/auth/
+Disallow: /private/
+
+User-agent: Googlebot
+Allow: /
+
+User-agent: Bingbot
+Allow: /
+
+Sitemap: https://animetsu.site/sitemap.xml

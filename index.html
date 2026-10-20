@@ -1,0 +1,380 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Animetsu - Watch Anime Online Free in HD | Sub & Dub</title>
+    <meta name="description" content="Stream your favorite anime online in high quality HD with subbed and dubbed episodes on Animetsu. Fast streaming, clean interface, and daily updates." />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="canonical" href="https://animetsu.site/" />
+    <meta name="theme-color" content="#00000000" />
+    <link rel="manifest" href="manifest.json" />
+    <link rel="icon" href="favicon.ico" />
+    <link rel="apple-touch-icon" href="apple-touch-icon.png" />
+    
+    <!-- Search Engine Directives -->
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
+    <meta name="googlebot" content="index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1" />
+
+    <!-- Open Graph (Facebook / Discord / Social) -->
+    <meta property="og:site_name" content="Animetsu" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="Animetsu - Watch Anime Online Free in HD | Sub & Dub" />
+    <meta property="og:description" content="Stream your favorite anime online in high quality HD with subbed and dubbed episodes on Animetsu. Fast streaming, clean interface, and daily updates." />
+    <meta property="og:url" content="https://animetsu.site/" />
+    <meta property="og:image" content="https://animetsu.site/android-chrome-512x512.png" />
+
+    <!-- Twitter Cards -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Animetsu - Watch Anime Online Free in HD | Sub & Dub" />
+    <meta name="twitter:description" content="Stream your favorite anime online in high quality HD with subbed and dubbed episodes on Animetsu. Fast streaming, clean interface, and daily updates." />
+    <meta name="twitter:image" content="https://animetsu.site/android-chrome-512x512.png" />
+
+    <!-- Schema.org JSON-LD Structured Data (Google Sitelinks SearchBox & Knowledge Graph) -->
+    <script type="application/ld+json">
+    {
+      "@context": "https://schema.org",
+      "@type": "WebSite",
+      "name": "Animetsu",
+      "alternateName": [
+        "Animetsu Site",
+        "Animetsu TV",
+        "Animetsu CC",
+        "Animetsu Live",
+        "Animetsu Net",
+        "Animetsu BZ"
+      ],
+      "url": "https://animetsu.site/",
+      "description": "Stream your favorite anime online in high quality HD with subbed and dubbed episodes on Animetsu.",
+      "potentialAction": {
+        "@type": "SearchAction",
+        "target": {
+          "@type": "EntryPoint",
+          "urlTemplate": "https://animetsu.site/search?q={search_term_string}"
+        },
+        "query-input": "required name=search_term_string"
+      }
+    }
+    </script>
+
+    <!-- Resource Preconnects for Core Web Vitals -->
+    <link rel="dns-prefetch" href="https://image.tmdb.org" />
+    <link rel="preconnect" href="https://image.tmdb.org" crossorigin />
+    <link rel="dns-prefetch" href="https://tmdb.screenscape.me" />
+    <link rel="preconnect" href="https://s4.anilist.co" crossorigin />
+    <link rel="preconnect" href="https://api.ani.zip" crossorigin />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Nunito+Sans:ital,opsz,wdth,wght,YTLC@0,6..12,75..125,200..1000,440..540;1,6..12,75..125,200..1000,440..540&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      #initial-loader {
+        pointer-events: none;
+        transition: opacity 0.5s ease;
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100dvh;
+        background: #000;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        align-items: center;
+        justify-content: center;
+        z-index: 9999;
+      }
+      .bar-track {
+        width: 180px;
+        height: 4px;
+        background: rgba(255, 255, 255, 0.1);
+        border-radius: 999px;
+        overflow: hidden;
+      }
+      .bar-indicator {
+        width: 40px;
+        height: 100%;
+        background: rgba(255, 255, 255, 0.9);
+        border-radius: inherit;
+        animation: slide 1.1s ease-in-out infinite;
+      }
+      @keyframes slide {
+        0% {
+          transform: translateX(-20px);
+          width: 0px;
+        }
+        25% {
+          width: 20px;
+        }
+        50% {
+          width: 40px;
+        }
+        75% {
+          width: 20px;
+        }
+        100% {
+          transform: translateX(180px);
+          width: 0px;
+        }
+      }
+      .animetsu-timestamp {
+        color: #38bdf8 !important;
+        cursor: pointer !important;
+        font-weight: 600 !important;
+        text-decoration: none !important;
+        user-select: text !important;
+      }
+      .animetsu-timestamp:hover {
+        color: #38bdf8 !important;
+        text-decoration: none !important;
+        background: transparent !important;
+      }
+    </style>
+    <script>
+      window.p = "https://swiftstream.top/proxy";
+      window.b = `${window.location.origin}/v2`;
+      window.set_ael = window.set_ael || (() => {});
+      localStorage.removeItem("server-note");
+      try {
+        ['guest-settings', 'usr_guest_animetsu-settings', 'animetsu-settings'].forEach(k => {
+          const raw = localStorage.getItem(k);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (parsed.ambient_mode === 'off' || parsed.auto_mini === 'off') {
+              parsed.ambient_mode = 'on';
+              parsed.auto_mini = 'on';
+              localStorage.setItem(k, JSON.stringify(parsed));
+            }
+          }
+        });
+      } catch (e) {}
+      try {
+        const sess = localStorage.getItem('animetsu_sess');
+        if (sess) {
+          document.cookie = 'animetsu_sess=' + sess + '; path=/; max-age=31536000; SameSite=Lax';
+        }
+      } catch (e) {}
+      // Purge old home cache to reload with crisp TMDB logos
+      try {
+        localStorage.removeItem('animetsu_last_home');
+        Object.keys(localStorage).forEach(k => {
+          if (k.startsWith('animetsu_logo_')) {
+            const v = localStorage.getItem(k);
+            if (!v || !v.includes('image.tmdb.org')) localStorage.removeItem(k);
+          }
+        });
+      } catch (e) {}
+
+      // Purge old blurry logos from local storage
+      try {
+        const lastHome = localStorage.getItem('animetsu_last_home');
+        if (lastHome && (lastHome.includes('.jpg') || lastHome.includes('/icons/'))) {
+          localStorage.removeItem('animetsu_last_home');
+        }
+        Object.keys(localStorage).forEach(k => {
+          if (k.startsWith('animetsu_logo_')) {
+            const val = localStorage.getItem(k);
+            if (val && (val.endsWith('.jpg') || val.includes('/icons/'))) {
+              localStorage.removeItem(k);
+            }
+          }
+        });
+      } catch (e) {}
+
+
+      // Normalize shared watch URLs like /watch?id=123&ep=1 to /watch/123/1
+      try {
+        const wm = window.location.pathname.match(/^(.*\/watch)\/?$/);
+        if (wm) {
+          const params = new URLSearchParams(window.location.search);
+          const wid = params.get("id");
+          if (wid) {
+            const wep = params.get("ep") || "1";
+            window.history.replaceState(null, "", wm[1] + "/" + encodeURIComponent(wid) + "/" + encodeURIComponent(wep));
+          }
+        }
+      } catch (e) {}
+
+      setTimeout(() => {
+        const loader = document.getElementById("initial-loader");
+        if (loader) {
+          loader.style.opacity = "0";
+          setTimeout(() => loader.remove(), 400);
+        }
+      }, 1000);
+    </script>
+    <script src="config/ads.js?v=smart_3m"></script>
+    <script src="assets/client_engine.js?v=v2_4"></script>
+    <script type="module" crossorigin src="assets/index.js?v=v2_4"></script>
+    <script>
+      // Universal base detection: works at domain root AND under subpaths
+      // (GitHub Pages project sites, parent-folder dev servers, anywhere).
+      // The module bundle always sits at <base>/assets/index.js, so the
+      // install prefix is derived from its resolved URL.
+      (function () {
+        var base = "";
+        try {
+          var mod = document.querySelector('script[type="module"][src*="index.js"]');
+          if (mod) {
+            var u = new URL(mod.getAttribute("src"), location.href);
+            var m = u.pathname.match(/^(.*)\/assets\/index\.js$/);
+            if (m && m[1]) base = m[1];
+          }
+        } catch (e) {}
+        window.__ANIMETSU_BASE__ = base;            // for the SPA router
+        window.ANIMETSU_ASSET_BASE = base + "/";    // for JS-injected asset URLs
+        // GitHub Pages 404-redirect recovery: restore the deep-link route
+        try {
+          var saved = sessionStorage.getItem("animetsu_404_path");
+          if (saved) {
+            sessionStorage.removeItem("animetsu_404_path");
+            var prefixed = base + "/";
+            if (saved.indexOf(prefixed) === 0) {
+              history.replaceState(null, "", saved);
+            }
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="stylesheet" crossorigin href="assets/index.css?v=v2_4" />
+    <script>
+      // Local-preview guard: explains 404s when this folder is not the server root
+      window.addEventListener("load", function () {
+        fetch("manifest.json", { method: "HEAD" })
+          .then(function (r) {
+            if (!r.ok)
+              console.warn(
+                "[Animetsu Mirror] Static files return " + r.status + ". The site folder is NOT the server root. Open THIS folder directly in VS Code/Five Server (or run start-server.bat, or drag the folder to app.netlify.com/drop). See README > Local preview."
+              );
+          })
+          .catch(function () {
+            console.warn(
+              "[Animetsu Mirror] Could not reach /manifest.json - the site folder is not the server root (or the page was opened via file://). Run a local server from INSIDE this folder. See README > Local preview."
+            );
+          });
+      });
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <div id="initial-loader">
+      <img
+        src="android-chrome-192x192.png"
+        alt=""
+        style="width: 100px; height: 100px; filter: invert()"
+      />
+      <div class="bar-track">
+        <div class="bar-indicator"></div>
+      </div>
+    </div>
+
+    <!-- Page-Specific Script Ads (Home & Watch) -->
+    <script>
+      (function initPageScriptAds() {
+        function checkAndInjectScript() {
+          const p = window.location.pathname;
+          const isHome = p === "/" || p === "/home" || p === "" || p === "/home/";
+          const isWatch = p.startsWith("/watch");
+          const cfg = window.__ANIMETSU_ADS_CONFIG__;
+
+          if (isHome) {
+            const src = cfg?.getHomeScriptSrc?.();
+            if (src && !document.querySelector('script[data-ad-page="home"]')) {
+              const sc = document.createElement("script");
+              sc.src = src;
+              sc.async = true;
+              sc.setAttribute("data-ad-page", "home");
+              document.head.appendChild(sc);
+              console.log("⚡ [Ad Engine] Home Popunder Script active:", src);
+            }
+          } else if (isWatch) {
+            const src = cfg?.getWatchScriptSrc?.();
+            if (src && !document.querySelector('script[data-ad-page="watch"]')) {
+              const sc = document.createElement("script");
+              sc.src = src;
+              sc.async = true;
+              sc.setAttribute("data-ad-page", "watch");
+              document.head.appendChild(sc);
+              console.log("⚡ [Ad Engine] Watch Page Popunder Script active:", src);
+            }
+          }
+        }
+
+        checkAndInjectScript();
+        window.addEventListener("popstate", checkAndInjectScript);
+        const origPush = history.pushState;
+        history.pushState = function () {
+          origPush.apply(this, arguments);
+          setTimeout(checkAndInjectScript, 100);
+        };
+      })();
+    </script>
+
+    <!-- Timed Smartlink Ad Engine (3-Minute Cooldown) -->
+    <script>
+      (function () {
+        const AD_STORAGE_KEY = "animetsu_last_smartlink_time";
+
+        function getPageKey() {
+          const p = window.location.pathname;
+          if (p === "/" || p === "/home" || p === "" || p === "/home/" || p.startsWith("/home?")) return "home";
+          if (p.startsWith("/anime/")) return "anime";
+          if (p.startsWith("/browse")) return "browse";
+          if (p.startsWith("/schedule")) return "schedule";
+          if (p.startsWith("/watch")) return "watch";
+          return "general";
+        }
+
+        function isCooldownOver() {
+          const cfg = window.__ANIMETSU_ADS_CONFIG__;
+          if (!cfg || !cfg.enabled) return false;
+          const cdSeconds = (typeof cfg.getCooldownSeconds === "function" ? cfg.getCooldownSeconds() : 180);
+          try {
+            const lastTime = parseInt(localStorage.getItem(AD_STORAGE_KEY) || "0", 10);
+            if (!lastTime) return true; // First visit -> trigger ad
+            return (Date.now() - lastTime) >= (cdSeconds * 1000);
+          } catch (e) {
+            return true;
+          }
+        }
+
+        function recordAdTrigger() {
+          try {
+            localStorage.setItem(AD_STORAGE_KEY, Date.now().toString());
+          } catch (e) {}
+        }
+
+        // Capture phase click listener
+        document.addEventListener(
+          "click",
+          function (e) {
+            const pageKey = getPageKey();
+            // STRICT: Pop ad only triggers on Home and Watch pages!
+            if (pageKey !== "home" && pageKey !== "watch") return;
+
+            // If any page has an active script ad, let the script handle it
+            if (pageKey === "home" && window.__ANIMETSU_ADS_CONFIG__?.getHomeScriptSrc?.()) return;
+            if (pageKey === "watch" && window.__ANIMETSU_ADS_CONFIG__?.getWatchScriptSrc?.()) return;
+
+            if (isCooldownOver()) {
+              const smartlinkUrl = window.__ANIMETSU_ADS_CONFIG__?.getSmartlinkUrl?.(pageKey);
+              if (!smartlinkUrl) return; // Ads disabled
+
+              recordAdTrigger();
+              window.open(smartlinkUrl, "_blank");
+
+              // If clicked on an interactive link/button, prevent 1st click navigation so user stays on site
+              const interactive = e.target.closest('a, button, [role="button"]');
+              if (interactive) {
+                e.preventDefault();
+                e.stopPropagation();
+                return false;
+              }
+            }
+          },
+          true
+        );
+      })();
+    </script>
+  </body>
+</html>
