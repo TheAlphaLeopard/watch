@@ -13,8 +13,7 @@ window.WISP_CONFIG = {
   // Wisp servers in priority order. The first healthy one is used; a server
   // that fails gets its own cooldown and the next one takes over.
   wispServers: [
-    'wss://truffled.lol/wisp/',
-    'wss://wisp.mercurywork.shop/wisp/'
+    'wss://truffled.lol/wisp/'
   ],
 
   // Self-contained wisp transport module (Epoxy; WASM inlined, no sidecars).
