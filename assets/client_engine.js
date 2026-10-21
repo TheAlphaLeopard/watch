@@ -255,6 +255,237 @@
   // Rate-limit backoff flag (AniList 90 req/min safeguard)
   let anilistRateLimitedUntil = 0;
 
+  // =====================================================================
+  // Network resilience layer (v2.7)
+  // Stops repeated console 404/CORS storms by:
+  //   1. Negative-caching AniZip "misses" so an impossible lookup is never
+  //      retried (and never paired with a meaningless second probe).
+  //   2. Routing every Jikan call through a sequential queue with 429
+  //      backoff + timeout retries (kills "signal timed out" spam).
+  //   3. Backing off from a hard-down or CORS-blocked AniList endpoint and
+  //      retrying through the wisp tunnel instead of hammering it.
+  //   4. A wisp-only fallback path (no third-party CORS relays): direct
+  //      fetch first, HTTP-over-wisp second, per-server failover.
+  // =====================================================================
+  let anilistNetBlockedUntil = 0;   // direct POST failed at network/CORS level
+  let anilistHttpFailUntil = 0;    // AniList API itself returned 403/5xx (e.g. "temporarily disabled")
+  const anilistFailUntilBySig = new Map(); // query signature -> retry-not-before ms
+  const anizipMissCache = new Map();       // 'a'+id / 'm'+id -> retry-not-before ms (6h)
+  const jikanFailUntilByUrl = new Map();   // url -> retry-not-before ms (short)
+  const pendingAnizipFetches = new Map();  // url -> in-flight promise
+  const malSourcedIds = new Set();         // ids verified to be MAL ids (from Jikan-sourced payloads)
+
+  // --- Wisp fallback path (v2.7) ---
+  // Last link of the chain: HTTP-over-wisp through the nano epoxy transport
+  // (assets/wisp-net.js + config/wisp.js). Reaches hosts a browser fetch()
+  // cannot (wifi filters, CORS-less hosts). Never used for same-origin paths.
+  const WISP_NET = (typeof window !== 'undefined' && window.WispNet) ? window.WispNet : null;
+  function wispAvailable() {
+    if (!WISP_NET) return false;
+    try {
+      const cfg = WISP_NET.config || {};
+      if (cfg.enabled === false) return false;
+      if (typeof WISP_NET.isCoolingDown === 'function' && WISP_NET.isCoolingDown()) return false;
+    } catch { return false; }
+    return true;
+  }
+
+  async function wispFetch(url, init, timeoutMs) {
+    if (!WISP_NET) throw new Error('wisp module not loaded');
+    return await WISP_NET.fetch(url, init, timeoutMs);
+  }
+
+  // Provider JSON helper: direct-first with timeout; on a network/CORS-level
+  // failure ( thrown before a response arrives) retry once via wisp. Same
+  // -origin (relative) URLs never route through wisp. Intent also stays: a
+  // real HTTP 4xx/5xx is NOT retried via wisp - that is a server answer.
+  async function streamResilientFetch(url, opts = {}, timeoutMs = 8000) {
+    const raw = typeof url === 'string' ? url : String(url);
+    const sameOrigin = raw.startsWith('/') || raw.startsWith('./');
+    try {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), timeoutMs);
+      const res = await originalFetch(raw, { ...opts, signal: controller.signal });
+      clearTimeout(timer);
+      return res;
+    } catch (firstErr) {
+      if (sameOrigin || !wispAvailable()) throw firstErr;
+      console.warn('[ClientEngine] Direct provider fetch failed (' + (firstErr && firstErr.message || firstErr) + ') - retrying via wisp.');
+      try { return await wispFetch(raw, opts, timeoutMs + 2000); }
+      catch (wispErr) { throw firstErr; } // the original cause matters more
+    }
+  }
+
+  // Launch a Jikan request while honouring their 3 req/s & 60 req/min limits.
+  // Serialises calls, backs off on 429 and retries timeouts with a longer window.
+  function jikanFetch(url, timeoutMs = 6500, attempts = 2) {
+    const failUntil = jikanFailUntilByUrl.get(url) || 0;
+    if (Date.now() < failUntil) {
+      return Promise.reject(new Error('Jikan recently failed for this endpoint (backoff window)'));
+    }
+    if (!jikanFetch._chain) jikanFetch._chain = Promise.resolve();
+    const run = jikanFetch._chain.then(async () => {
+      // enforce min spacing between Jikan calls (3 req/s limit)
+      const gap = Math.max(0, (jikanFetch._last || 0) + 360 - Date.now());
+      if (gap) await new Promise(r => setTimeout(r, gap));
+      jikanFetch._last = Date.now();
+
+      let lastErr = null;
+      for (let attempt = 0; attempt < attempts; attempt++) {
+        const timeout = timeoutMs + attempt * 2000;
+        try {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), timeout);
+          const res = await originalFetch(url, { signal: controller.signal });
+          clearTimeout(timer);
+          if (res.status === 429) {
+            lastErr = new Error('Jikan rate limit (429)');
+            try { jikanFailUntilByUrl.set(url, Date.now() + Math.max((Number(res.headers.get('retry-after')) || 0) * 1000, 900)); } catch {}
+            await new Promise(r => setTimeout(r, 900));
+            continue;
+          }
+          return res;
+        } catch (err) {
+          lastErr = err;
+          if (attempt < attempts - 1) {
+            await new Promise(r => setTimeout(r, 450 + attempt * 350));
+          }
+        }
+      }
+      // All direct attempts failed (blocked network / CORS / timeouts):
+      // one last try through the wisp tunnel, still respecting the queue.
+      if (wispAvailable()) {
+        try {
+          const wRes = await wispFetch(url, {}, 10000);
+          if (wRes.status === 429) {
+            jikanFailUntilByUrl.set(url, Date.now() + 25000);
+            throw new Error('Jikan rate limit (429 via wisp)');
+          }
+          console.debug('[ClientEngine] Jikan recovered via wisp:', url);
+          return wRes;
+        } catch (wispErr) {
+          lastErr = wispErr;
+        }
+      }
+      jikanFailUntilByUrl.set(url, Date.now() + 25000);
+      throw lastErr || new Error('Jikan unreachable');
+    });
+    jikanFetch._chain = run.catch(() => {}); // keep queue alive after failures
+    return run;
+  }
+
+  // Wrap every ani.zip /mappings probe:
+  //   - dedupes identical in-flight requests,
+  //   - negative-caches 404 "miss" results for 6 hours so the same impossible
+  //     lookup never re-fires (or re-logs a browser 404) on later renders.
+  // Returns { status: 'ok', json } | { status: 'miss' } | { status: 'error' }
+  async function anizipFetch(url) {
+    const missUntil = anizipMissCache.get(url) || 0;
+    if (Date.now() < missUntil) return { status: 'miss' };
+    if (pendingAnizipFetches.has(url)) return pendingAnizipFetches.get(url);
+
+    const promise = (async () => {
+      // Direct first (with a hard timeout), then a single wisp retry on a
+      // network-level failure. HTTP 404 is a "miss" (negative-cached), an
+      // outage is an "error" -> retried later; we never wisp-retry a 404.
+      let res = null;
+      try {
+        res = await originalFetch(url, { signal: AbortSignal.timeout(5000) });
+      } catch (firstErr) {
+        if (wispAvailable()) {
+          try { res = await wispFetch(url, {}, 9000); } catch { res = null; }
+        }
+      }
+      try {
+        if (!res || !res.ok) {
+          if (res && res.status === 404) {
+            anizipMissCache.set(url, Date.now() + 6 * 60 * 60 * 1000);
+            return { status: 'miss' };
+          }
+          return { status: 'error' };
+        }
+        const json = await res.json();
+        // Cache the raw record under both configured ids (mirrors upstream logic)
+        if (json?.episodes && json?.mappings) {
+          if (json.mappings.anilist_id) memCache.set(`anizip_raw_${json.mappings.anilist_id}`, json);
+          if (json.mappings.mal_id) memCache.set(`anizip_raw_${json.mappings.mal_id}`, json);
+        }
+        return { status: 'ok', json };
+      } catch {
+        return { status: 'error' };
+      }
+    })();
+
+    pendingAnizipFetches.set(url, promise);
+    try {
+      return await promise;
+    } finally {
+      pendingAnizipFetches.delete(url);
+    }
+  }
+
+  // Resolve what a numeric anime id actually is (AniList id vs MAL id) using
+  // ani.zip mappings. Self-match check avoids cross-namespace false positives.
+  // Returns { matchedBy: 'anilist'|'mal'|null, anilistId, malId, json }
+  async function resolveAniZipMappings(numericId, preferNamespace = 'anilist') {
+    const numId = Number(numericId);
+    if (!numId) return { matchedBy: null, anilistId: null, malId: null, json: null };
+
+    const anilistUrl = `${ANIZIP_URL}?anilist_id=${numId}`;
+    const malUrl = `${ANIZIP_URL}?mal_id=${numId}`;
+
+    const anMissed = Date.now() < (anizipMissCache.get(anilistUrl) || 0) || malSourcedIds.has(String(numId));
+    const malMissed = Date.now() < (anizipMissCache.get(malUrl) || 0);
+
+    const probe = async (url, selfField) => {
+      const r = await anizipFetch(url);
+      if (r.status === 'ok' && r.json?.mappings) {
+        const matched = Number(r.json.mappings[selfField]) === numId;
+        return { ok: true, matched, json: r.json };
+      }
+      return { ok: false, matched: false, json: null };
+    };
+
+    let first = null;
+    let second = null;
+    const order = preferNamespace === 'mal' ? ['mal', 'anilist'] : ['anilist', 'mal'];
+
+    if (order[0] === 'anilist') {
+      if (!anMissed) first = await probe(anilistUrl, 'anilist_id');
+      if ((!first || !first.ok) && !malMissed) {
+        second = await probe(malUrl, 'mal_id');
+      }
+    } else {
+      if (!malMissed) first = await probe(malUrl, 'mal_id');
+      if ((!first || !first.ok) && !anMissed) second = await probe(anilistUrl, 'anilist_id');
+    }
+
+    // Return whichever probe produced a self-matched record
+    const hit = (first && first.matched) ? first : ((second && second.matched) ? second : null);
+    if (hit) {
+      const m = Number(hit.json.mappings.anilist_id) || null;
+      const mm = Number(hit.json.mappings.mal_id) || null;
+      if (hit.json.mappings.anilist_id && hit.json.mappings.anilist_id !== numId) {
+        anizipMissCache.set(anilistUrl, Date.now() + 6 * 60 * 60 * 1000); // not this anime under that namespace
+      }
+      if (hit.json.mappings.mal_id && Number(hit.json.mappings.mal_id) !== numId) {
+        anizipMissCache.set(malUrl, Date.now() + 6 * 60 * 60 * 1000);
+      }
+      return {
+        matchedBy: hit === first ? order[0] : order[1],
+        anilistId: m,
+        malId: mm,
+        json: hit.json
+      };
+    }
+
+    // No self-matched record: remember both misses so nothing retries for 6h.
+    if (!anMissed) anizipMissCache.set(anilistUrl, Date.now() + 6 * 60 * 60 * 1000);
+    if (!malMissed) anizipMissCache.set(malUrl, Date.now() + 6 * 60 * 60 * 1000);
+    return { matchedBy: null, anilistId: null, malId: null, json: null };
+  }
+
+
   // Multi-tier persistent cache helpers (Memory + LocalStorage / SessionStorage)
   function getStorage(type = 'local') {
     try {
@@ -348,38 +579,111 @@
   }
 
   async function queryAniList(query, variables = {}, timeoutMs = 8000) {
-    if (Date.now() < anilistRateLimitedUntil) {
+    const now = Date.now();
+    if (now < anilistRateLimitedUntil) {
       console.warn('⚠️ [ClientEngine] AniList cooldown active (rate-limited). Skipping query to protect IP.');
       return null;
     }
-    try {
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeoutMs);
-      const res = await originalFetch(ANILIST_URL, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json'
-        },
-        body: JSON.stringify({ query, variables }),
-        signal: controller.signal
-      });
-      clearTimeout(timer);
-      if (res.status === 429) {
-        console.warn('⚠️ [ClientEngine] AniList returned HTTP 429 (Too Many Requests)! Cooling down for 60 seconds.');
-        anilistRateLimitedUntil = Date.now() + 60000;
-        throw new Error('AniList HTTP 429 Rate Limit');
+
+    // Per-query negative cache: identical queries that failed recently are
+    // short-circuited so repeated renders don't spam the network or console.
+    const sig = String(query).slice(0, 160).replace(/\s+/g, ' ') + '::' + JSON.stringify(variables || {});
+    if (now < (anilistFailUntilBySig.get(sig) || 0)) return null;
+    // Hard-down / blocked endpoint: skip the direct attempt entirely (it would
+    // only produce browser CORS errors); the wisp attempts below still run.
+    const hardBlocked = (now < anilistHttpFailUntil) || (now < anilistNetBlockedUntil);
+
+    let lastErr = null;
+
+    // 1. Direct fetch (the browser's CORS still applies; AniList normally allows any origin)
+    if (!hardBlocked) {
+      try {
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), timeoutMs);
+        const res = await originalFetch(ANILIST_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          },
+          body: JSON.stringify({ query, variables }),
+          signal: controller.signal
+        });
+        clearTimeout(timer);
+        if (res.status === 429) {
+          console.warn('⚠️ [ClientEngine] AniList returned HTTP 429 (Too Many Requests)! Cooling down for 60 seconds.');
+          anilistRateLimitedUntil = Date.now() + 60000;
+          throw new Error('AniList HTTP 429 Rate Limit');
+        }
+        if (!res.ok) {
+          // e.g. AniList API outage (403 "temporarily disabled"), 5xx, etc.
+          anilistHttpFailUntil = Date.now() + 5 * 60 * 1000;
+          throw new Error(`AniList HTTP ${res.status}`);
+        }
+        const json = await res.json();
+        if (json.errors && json.errors.length) {
+          throw new Error(json.errors[0]?.message || 'AniList GraphQL error');
+        }
+        return json?.data || null;
+      } catch (err) {
+        lastErr = err;
+        const timedOut = err && String(err.name || err.message || '').toLowerCase().includes('abort');
+        if (!timedOut && (String(err.message || '')).includes('Failed to fetch')) {
+          // network/CORS level failure -> don't repeat the un-proxied attempt for a while
+          anilistNetBlockedUntil = Date.now() + 4 * 60 * 1000;
+        }
       }
-      if (!res.ok) throw new Error(`AniList HTTP ${res.status}`);
-      const json = await res.json();
-      if (json.errors && json.errors.length) {
-        throw new Error(json.errors[0]?.message || 'AniList GraphQL error');
-      }
-      return json?.data || null;
-    } catch (err) {
-      console.warn(`[ClientEngine] AniList failed (${err.message}). Falling back to MAL (Jikan)...`);
-      return null;
+    } else {
+      lastErr = new Error('AniList endpoint in backoff window');
     }
+
+    // 2. Wisp tunnel (wisp protocol over a single multiplexed WebSocket —
+    //    truffled.lol first, mercurywork.shop second). Bypasses CORS and wifi
+    //    filters entirely; WebSocket connects where fetch() cannot.
+    const body = { query, variables };
+    if (wispAvailable()) {
+      // 2a. POST-mode (native GraphQL endpoint through wisp)
+      try {
+        const wRes = await wispFetch(ANILIST_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
+          body: JSON.stringify(body)
+        }, 9000);
+        if (wRes.ok) {
+          const wJson = await wRes.json();
+          if (wJson && !wJson.errors && wJson?.data) {
+            // tunnel worked: clear the hard-block windows
+            anilistRateLimitedUntil = 0;
+            anilistNetBlockedUntil = 0;
+            anilistHttpFailUntil = 0;
+            return wJson.data || null;
+          }
+        } else if (wRes.status === 429) {
+          anilistRateLimitedUntil = Date.now() + 60000;
+        }
+      } catch {}
+      // 2b. GET-mode (some wisp backends mangle POST bodies; GET never does)
+      try {
+        const wRes = await wispFetch(
+          ANILIST_URL + '?query=' + encodeURIComponent(body.query) +
+          (body.variables ? '&variables=' + encodeURIComponent(JSON.stringify(body.variables)) : ''),
+          {}, 9000
+        );
+        if (wRes.ok) {
+          const wJson = await wRes.json();
+          if (wJson && !wJson.errors && wJson?.data) {
+            anilistRateLimitedUntil = 0;
+            anilistNetBlockedUntil = 0;
+            anilistHttpFailUntil = 0;
+            return wJson.data || null;
+          }
+        }
+      } catch {}
+    }
+
+    anilistFailUntilBySig.set(sig, Date.now() + 15000); // don't re-attempt this exact query for 15s
+    console.warn(`[ClientEngine] AniList failed (${(lastErr && lastErr.message) || 'unreachable'}). Falling back to MAL (Jikan)...`);
+    return null;
   }
 
   function getHdCover(url) {
@@ -423,24 +727,28 @@
     if (!numericId) return malId;
     if (malToAnilistCache.has(numericId)) return malToAnilistCache.get(numericId);
 
-    // Try AniZip with mal_id parameter
-    try {
-      const res = await originalFetch(`${ANIZIP_URL}?mal_id=${numericId}`, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const json = await res.json();
-        const aniId = json.mappings?.anilist_id;
-        if (aniId) {
-          malToAnilistCache.set(numericId, Number(aniId));
-          if (json.episodes) {
-            memCache.set(`anizip_raw_${numericId}`, json);
-            memCache.set(`anizip_raw_${aniId}`, json);
-          }
-          return Number(aniId);
-        }
-      }
-    } catch (e) {}
+    // 1. Check in-memory anime detail caches
+    const cachedDetail = memCache.get(`details_${numericId}`) || memCache.get(`anime_details_${numericId}`);
+    if (cachedDetail?.anilist_id) {
+      const aniId = Number(cachedDetail.anilist_id);
+      malToAnilistCache.set(numericId, aniId);
+      return aniId;
+    }
 
-    return numericId;
+    // 2. Check anizip_raw cache
+    const cachedZip = memCache.get(`anizip_raw_${numericId}`);
+    if (cachedZip?.mappings?.anilist_id) {
+      const aniId = Number(cachedZip.mappings.anilist_id);
+      malToAnilistCache.set(numericId, aniId);
+      return aniId;
+    }
+
+    // 3. Resolve through ani.zip (anilist-side probe first for engine IDs, with
+    //    negative caching so misses never re-fire).
+    const resolved = await resolveAniZipMappings(numericId);
+    const aniId = Number(resolved && resolved.anilistId) || numericId;
+    malToAnilistCache.set(numericId, aniId);
+    return aniId;
   }
 
   // Helper: Resolve MAL ID from AniList ID or numeric ID using AniZip & in-memory cache
@@ -467,37 +775,18 @@
       return malId;
     }
 
-    // 3. Query AniZip with anilist_id
-    try {
-      const res = await originalFetch(`${ANIZIP_URL}?anilist_id=${numericId}`, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const json = await res.json();
-        const malId = json.mappings?.mal_id;
-        if (malId) {
-          const numMalId = Number(malId);
-          anilistToMalCache.set(numericId, numMalId);
-          if (json.episodes) {
-            memCache.set(`anizip_raw_${numericId}`, json);
-            memCache.set(`anizip_raw_${numMalId}`, json);
-          }
-          return numMalId;
-        }
-      }
-    } catch (e) {}
+    // 3. Resolve through ani.zip (self-matched mapping check, negative cache on miss)
+    const resolved = await resolveAniZipMappings(numericId);
+    if (resolved && Number(resolved.malId)) {
+      const numMalId = Number(resolved.malId);
+      anilistToMalCache.set(numericId, numMalId);
+      return numMalId;
+    }
 
-    // 4. Query AniZip with mal_id (in case animeId is already a MAL ID)
-    try {
-      const res = await originalFetch(`${ANIZIP_URL}?mal_id=${numericId}`, { signal: AbortSignal.timeout(4000) });
-      if (res.ok) {
-        const json = await res.json();
-        const malId = json.mappings?.mal_id || numericId;
-        const numMalId = Number(malId);
-        anilistToMalCache.set(numericId, numMalId);
-        return numMalId;
-      }
-    } catch (e) {}
-
-    // 5. Fallback: Return numericId
+    // 4. No ani.zip mapping (e.g. AniList-only simulcast with no MAL entry):
+    //    keep legacy behaviour of returning the raw id, but the miss is now
+    //    cached so this never re-fires for the same id.
+    anilistToMalCache.set(numericId, numericId);
     return numericId;
   }
 
@@ -818,11 +1107,46 @@
 
   async function queryJikanFallback(animeId, resolvedAnilistId) {
     const anilistId = resolvedAnilistId || (await getAnilistIdFromMalId(animeId));
-    const malId = Number(animeId) || anilistId;
-    console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId}, AniList: ${anilistId})`);
+    const numericId = Number(animeId);
 
-    // Query Jikan
-    const res = await originalFetch(`${JIKAN_URL}/anime/${malId}/full`, { signal: AbortSignal.timeout(5000) });
+    // Never feed an unverified AniList id to Jikan as if it were a MAL id:
+    // it can 404 (excess error spam) or, worse, return the WRONG anime.
+    // Only call Jikan with an id that is proven to belong to MAL.
+    let malId = null;
+    if (malSourcedIds.has(String(numericId))) {
+      malId = numericId;
+      console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId}, AniList: ${anilistId})`);
+    } else {
+      const resolved = await resolveAniZipMappings(numericId);
+      if (resolved.matchedBy === 'anilist' && Number(resolved.malId)) {
+        malId = Number(resolved.malId);
+        console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId} via ani.zip, AniList: ${anilistId})`);
+      } else if (resolved.matchedBy === 'mal' && Number(resolved.malId) === numericId) {
+        malId = numericId;
+        console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId}, AniList: ${anilistId})`);
+      } else if (resolved.json?.mappings?.animeplanet_id) {
+        // Last resort: search Jikan by the ani.zip animeplanet slug
+        const slug = String(resolved.json.mappings.animeplanet_id).replace(/[-_]+/g, ' ').trim();
+        try {
+          const sRes = await jikanFetch(`${JIKAN_URL}/anime?q=${encodeURIComponent(slug)}&limit=3`, 5000, 1);
+          if (sRes.ok) {
+            const sJson = await sRes.json();
+            const hit = (sJson?.data || [])[0];
+            if (hit?.mal_id) {
+              malId = Number(hit.mal_id);
+              console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId} via slug search, AniList: ${anilistId})`);
+            }
+          }
+        } catch {}
+      }
+    }
+
+    if (!malId) {
+      throw new Error(`No MAL mapping available for AniList ID ${animeId}`);
+    }
+
+    // Query Jikan (queue + rate-limit + timeout aware)
+    const res = await jikanFetch(`${JIKAN_URL}/anime/${malId}/full`, 7000, 2);
     if (!res.ok) throw new Error(`Jikan HTTP ${res.status}`);
     const json = await res.json();
     const d = json?.data;
@@ -896,6 +1220,14 @@
       return cached;
     }
 
+    // Failure backoff: if both providers failed for this id in the last 2 min,
+    // don't re-fire the network storm — serve stale/persistedLastResort instantly.
+    if (Date.now() < (memCache.get(`info_fail_${animeId}`) || 0)) {
+      const staleFail = getStaleCachedItem(cacheKey, 'local');
+      if (staleFail && staleFail.id) return staleFail;
+      return null;
+    }
+
     return dedupeRequest(`info_${animeId}`, async () => {
       // 1. Primary: AniList Direct Browser Fetch (Zero backend calls)
       try {
@@ -937,6 +1269,10 @@
       const stale = getStaleCachedItem(cacheKey, 'local');
       if (stale && stale.id) return stale;
 
+      // Both sources failed: start the short backoff window for this id so the
+      // next render doesn't replay the whole failing cascade.
+      memCache.set(`info_fail_${animeId}`, Date.now() + 2 * 60 * 1000);
+
       // Final fallback object
       return {
         id: String(animeId),
@@ -974,33 +1310,17 @@
     const anilistId = await getAnilistIdFromMalId(animeId);
     let data = memCache.get(`anizip_raw_${animeId}`) || (anilistId ? memCache.get(`anizip_raw_${anilistId}`) : null);
 
-    // 1. Direct fast AniZip query with anilist_id
+    // 1. Direct fast AniZip query with anilist_id (negative-cached, quiet 404s)
     if (!data) {
-      try {
-        const queryId = anilistId || animeId;
-        const res = await originalFetch(`${ANIZIP_URL}?anilist_id=${encodeURIComponent(queryId)}`, { signal: AbortSignal.timeout(5000) });
-        if (res.ok) {
-          data = await res.json();
-          if (data?.mappings?.anilist_id) {
-            memCache.set(`anizip_raw_${data.mappings.anilist_id}`, data);
-            if (data.mappings.mal_id) memCache.set(`anizip_raw_${data.mappings.mal_id}`, data);
-          }
-        }
-      } catch (e1) {}
+      const queryId = anilistId || animeId;
+      const zipped = await anizipFetch(`${ANIZIP_URL}?anilist_id=${encodeURIComponent(queryId)}`);
+      if (zipped.status === 'ok' && zipped.json) data = zipped.json;
     }
 
     // 2. Fallback AniZip query with mal_id if anilist_id didn't match
     if (!data) {
-      try {
-        const res = await originalFetch(`${ANIZIP_URL}?mal_id=${encodeURIComponent(animeId)}`, { signal: AbortSignal.timeout(4000) });
-        if (res.ok) {
-          data = await res.json();
-          if (data?.mappings?.anilist_id) {
-            memCache.set(`anizip_raw_${data.mappings.anilist_id}`, data);
-            if (data.mappings.mal_id) memCache.set(`anizip_raw_${data.mappings.mal_id}`, data);
-          }
-        }
-      } catch (e2) {}
+      const zippedMal = await anizipFetch(`${ANIZIP_URL}?mal_id=${encodeURIComponent(animeId)}`);
+      if (zippedMal.status === 'ok' && zippedMal.json) data = zippedMal.json;
     }
 
     let defaultImg = '';
@@ -1081,18 +1401,9 @@
             }
           }
         `;
-        const res = await originalFetch(ANILIST_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          body: JSON.stringify({ query: aniQuery, variables: { id: targetAniId } }),
-          signal: AbortSignal.timeout(5000)
-        });
-        if (res.ok) {
-          const json = await res.json();
-          const media = json?.data?.Media;
+        const aniData = await queryAniList(aniQuery, { id: targetAniId }, 5000);
+        if (aniData) {
+          const media = aniData?.Media;
           if (media) {
             const fallbackImg = media.bannerImage || media.coverImage?.extraLarge || media.coverImage?.large || defaultImg || '';
             const fallbackEpisodes = [];
@@ -1266,6 +1577,7 @@
 
     function mapJikanSearch(items) {
       return (items || []).map(d => {
+        if (d?.mal_id != null) malSourcedIds.add(String(d.mal_id));
         const cover = d.images?.webp?.large_image_url || d.images?.jpg?.large_image_url || '';
         return {
           id: String(d.mal_id),
@@ -1401,7 +1713,7 @@
         jikanUrl += `&status=${jStatus}`;
       }
 
-      const jRes = await originalFetch(jikanUrl, { signal: AbortSignal.timeout(5000) });
+      const jRes = await jikanFetch(jikanUrl, 6000, 2);
       if (jRes.ok) {
         const jJson = await jRes.json();
         if (jJson?.data?.length) {
@@ -1464,9 +1776,9 @@
         const tzParam = encodeURIComponent(userTz);
 
         const [resCurr, resNext, resPrev] = await Promise.allSettled([
-          fetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=0`).then(r => r.ok ? r.json() : null),
-          fetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=1`).then(r => r.ok ? r.json() : null),
-          fetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=-1`).then(r => r.ok ? r.json() : null)
+          streamResilientFetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=0`).then(r => r.ok ? r.json() : null),
+          streamResilientFetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=1`).then(r => r.ok ? r.json() : null),
+          streamResilientFetch(`https://reanime.to/api/v1/schedule?tz=${tzParam}&week=-1`).then(r => r.ok ? r.json() : null)
         ]);
 
         const allSchedules = [];
@@ -1649,7 +1961,7 @@
     let rawList = [];
 
     try {
-      const res = await originalFetch(`${JIKAN_URL}/seasons/now?limit=25`, { signal: AbortSignal.timeout(3000) });
+      const res = await jikanFetch(`${JIKAN_URL}/seasons/now?limit=25`, 4500, 2);
       if (res.ok) {
         const j = await res.json();
         if (j.data?.length) rawList = j.data;
@@ -1659,7 +1971,7 @@
     // 2. Fallback: Jikan Top Airing
     if (!rawList.length) {
       try {
-        const res = await originalFetch(`${JIKAN_URL}/top/anime?filter=airing&limit=25`, { signal: AbortSignal.timeout(3500) });
+        const res = await jikanFetch(`${JIKAN_URL}/top/anime?filter=airing&limit=25`, 4500, 2);
         if (res.ok) {
           const j = await res.json();
           if (j.data?.length) rawList = j.data;
@@ -1708,6 +2020,7 @@
       }
 
       animeForDay.forEach((item, slotIdx) => {
+        if (item.mal_id != null) malSourcedIds.add(String(item.mal_id));
         const slot = timeSlots[slotIdx % timeSlots.length];
         const airDate = new Date(dayDate);
         airDate.setHours(slot.h, slot.m, 0, 0);
@@ -1801,9 +2114,7 @@
     const type = isMovie ? 'movie' : 'tv';
     // 1. Primary: Screenscape TMDB Proxy (from Animetsu v1)
     try {
-      const res = await originalFetch(`${TMDB_PROXY_BASE}/${type}/${tmdbId}/images?api_key=${TMDB_API_KEY}`, {
-        signal: AbortSignal.timeout(2800)
-      });
+      const res = await streamResilientFetch(`${TMDB_PROXY_BASE}/${type}/${tmdbId}/images?api_key=${TMDB_API_KEY}`, {}, 2800);
       if (res.ok) {
         const data = await res.json();
         const logos = data.logos || [];
@@ -1816,9 +2127,7 @@
 
     // 2. Direct TMDB API fallback
     try {
-      const res = await originalFetch(`${TMDB_DIRECT_BASE}/${type}/${tmdbId}/images?api_key=${TMDB_API_KEY}`, {
-        signal: AbortSignal.timeout(2800)
-      });
+      const res = await streamResilientFetch(`${TMDB_DIRECT_BASE}/${type}/${tmdbId}/images?api_key=${TMDB_API_KEY}`, {}, 2800);
       if (res.ok) {
         const data = await res.json();
         const logos = data.logos || [];
@@ -2093,6 +2402,7 @@
     console.log('🔄 [ClientEngine] Fallback to MAL (Jikan) for Home data...');
     function mapJikanList(items) {
       return (items || []).map(item => {
+        if (item?.mal_id != null) malSourcedIds.add(String(item.mal_id));
         const img = item.images?.webp?.large_image_url || item.images?.jpg?.large_image_url || '';
         const trailerId = item.trailer?.youtube_id || '';
         return {
@@ -2129,7 +2439,7 @@
     async function fetchCategory(jikanUrl, limit = 20) {
       if (jikanUrl) {
         try {
-          const res = await originalFetch(jikanUrl, { signal: AbortSignal.timeout(4000) });
+          const res = await jikanFetch(jikanUrl, 5500, 2);
           if (res.ok) {
             const j = await res.json();
             if (j.data?.length) return mapJikanList(j.data).slice(0, limit);
@@ -2182,8 +2492,16 @@
       }
     } catch (e) {}
 
+    // Everything failed: start a short backoff window so the next render
+    // doesn't replay the entire failing cascade (the polling spam source).
+    memCache.set('home_fetch_fail_until', Date.now() + 90 * 1000);
     return { trending: [], seasonal: [], popular: [], top: [], upcoming: [] };
     });
+
+    // Backoff active? Serve whatever we have (stale or empty) without refetching.
+    if (Date.now() < (memCache.get('home_fetch_fail_until') || 0)) {
+      return staleCache || { trending: [], seasonal: [], popular: [], top: [], upcoming: [] };
+    }
 
     if (staleCache && (staleCache.trending?.length || staleCache.popular?.length)) {
       executeHomeFetch().then(fresh => {
@@ -2296,7 +2614,7 @@
     let recentItems = [];
 
     try {
-      const res = await originalFetch(`${JIKAN_URL}/seasons/now?page=${page}&limit=${perPage}`, { signal: AbortSignal.timeout(3500) });
+      const res = await jikanFetch(`${JIKAN_URL}/seasons/now?page=${page}&limit=${perPage}`, 4500, 2);
       if (res.ok) {
         const json = await res.json();
         if (json?.data?.length) recentItems = json.data;
@@ -2306,7 +2624,7 @@
     // 2. Fallback: Jikan Top Airing
     if (!recentItems.length) {
       try {
-        const res = await originalFetch(`${JIKAN_URL}/top/anime?filter=airing&page=${page}&limit=${perPage}`, { signal: AbortSignal.timeout(3500) });
+        const res = await jikanFetch(`${JIKAN_URL}/top/anime?filter=airing&page=${page}&limit=${perPage}`, 4500, 2);
         if (res.ok) {
           const json = await res.json();
           if (json?.data?.length) recentItems = json.data;
@@ -2316,6 +2634,7 @@
 
     if (recentItems.length) {
       const results = recentItems.map((item, idx) => {
+        if (item?.mal_id != null) malSourcedIds.add(String(item.mal_id));
         const img = item.images?.webp?.large_image_url || item.images?.jpg?.large_image_url || '';
         let viewsCount = 0;
         try {
@@ -3715,7 +4034,7 @@
           const aniId = (await getAnilistIdFromMalId(animeId)) || animeId;
           const track = lang === 'dub' ? 'dub' : 'sub';
           try {
-            const res = await fetch(`https://api.aniclover.cc/api/watch/${encodeURIComponent(aniId)}/${track}/${encodeURIComponent(epNum)}`);
+            const res = await streamResilientFetch(`https://api.aniclover.cc/api/watch/${encodeURIComponent(aniId)}/${track}/${encodeURIComponent(epNum)}`);
             if (res.ok) {
               const data = await res.json();
               if (data?.error || !data?.success || !data?.streamUrl) {
@@ -3760,10 +4079,10 @@
           try {
             let res = null;
             try {
-              res = await fetch(`https://api.animetsu.site/watch/piratexplay/${encodeURIComponent(aniId)}/${track}/piratexplay-${epNum}`);
+              res = await streamResilientFetch(`https://api.animetsu.site/watch/piratexplay/${encodeURIComponent(aniId)}/${track}/piratexplay-${epNum}`);
             } catch (e) {}
             if (!res || !res.ok) {
-              res = await fetch(`https://api.animetsu.site/watch/piratexplay/${encodeURIComponent(aniId)}/multi/piratexplay-${epNum}`);
+              res = await streamResilientFetch(`https://api.animetsu.site/watch/piratexplay/${encodeURIComponent(aniId)}/multi/piratexplay-${epNum}`);
             }
             if (res && res.ok) {
               const data = await res.json();
@@ -3867,14 +4186,14 @@
 
           // 1. Try Anivexa Worker Proxy (CORS-enabled for Client-Side)
           try {
-            const proxyRes = await fetch(`https://anivexa-proxy.apiplay.workers.dev/?url=${encodeURIComponent(flixTargetUrl)}`);
+            const proxyRes = await streamResilientFetch(`https://anivexa-proxy.apiplay.workers.dev/?url=${encodeURIComponent(flixTargetUrl)}`);
             if (proxyRes.ok) data = await proxyRes.json();
           } catch (e) {}
 
           // 2. Try local proxy fallback
           if (!data || !Array.isArray(data?.servers) || !data.servers.length) {
             try {
-              const localRes = await fetch(`/api/flix/${encodeURIComponent(aniId)}/${epNum}`);
+              const localRes = await streamResilientFetch(`/api/flix/${encodeURIComponent(aniId)}/${epNum}`);
               if (localRes.ok) data = await localRes.json();
             } catch (e) {}
           }
@@ -3882,7 +4201,7 @@
           // 3. Try direct fetch fallback
           if (!data || !Array.isArray(data?.servers) || !data.servers.length) {
             try {
-              const directRes = await fetch(flixTargetUrl);
+              const directRes = await streamResilientFetch(flixTargetUrl);
               if (directRes.ok) data = await directRes.json();
             } catch (e) {}
           }
@@ -3975,7 +4294,7 @@
           const aniId = (await getAnilistIdFromMalId(animeId)) || animeId;
           const track = lang === 'dub' ? 'dub' : 'sub';
           try {
-            const res = await fetch(`https://api.animetsu.site/watch/animegg/${encodeURIComponent(aniId)}/${track}/animegg-${epNum}`);
+            const res = await streamResilientFetch(`https://api.animetsu.site/watch/animegg/${encodeURIComponent(aniId)}/${track}/animegg-${epNum}`);
             if (res.ok) {
               const data = await res.json();
               if (data?.error) {
@@ -4052,9 +4371,9 @@
           try {
             let res = null;
             try {
-              res = await fetch(`https://api.animetsu.site/watch/mkissa/${encodeURIComponent(aniId)}/${track}/mkissa-${epNum}`);
+              res = await streamResilientFetch(`https://api.animetsu.site/watch/mkissa/${encodeURIComponent(aniId)}/${track}/mkissa-${epNum}`);
             } catch (e) {
-              res = await fetch(`/watch/mkissa/${encodeURIComponent(aniId)}/${track}/mkissa-${epNum}`);
+              res = await streamResilientFetch(`/watch/mkissa/${encodeURIComponent(aniId)}/${track}/mkissa-${epNum}`);
             }
             if (res && res.ok) {
               const data = await res.json();
@@ -4146,7 +4465,7 @@
           const aniId = (await getAnilistIdFromMalId(animeId)) || animeId;
           const track = lang === 'dub' ? 'dub' : 'sub';
           try {
-            const res = await fetch(`https://anshu.screenscape.me/watch/anikoto/${encodeURIComponent(aniId)}/${track}/anikoto-${epNum}`);
+            const res = await streamResilientFetch(`https://anshu.screenscape.me/watch/anikoto/${encodeURIComponent(aniId)}/${track}/anikoto-${epNum}`);
             if (res.ok) {
               const data = await res.json();
               if (data?.error) {
@@ -4201,7 +4520,7 @@
           const aniId = (await getAnilistIdFromMalId(animeId)) || animeId;
           const track = lang === 'dub' ? 'dub' : 'sub';
           try {
-            const res = await fetch(`https://anshu.screenscape.me/watch/aniwaves/${encodeURIComponent(aniId)}/${track}/aniwaves-${epNum}`);
+            const res = await streamResilientFetch(`https://anshu.screenscape.me/watch/aniwaves/${encodeURIComponent(aniId)}/${track}/aniwaves-${epNum}`);
             if (res.ok) {
               const data = await res.json();
               if (data?.error) {
