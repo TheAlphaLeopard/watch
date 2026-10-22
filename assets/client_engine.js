@@ -129,27 +129,32 @@
   }
 })();
 /**
- * Animetsu Pure Client-Side Engine & Multi-Source Crowdsourced Cache
+ * Animetsu Pure Client-Side Engine (Kitsu-only metadata)
  * 
  * Features:
  * 1. Client-Side Data Fetching: Queries open APIs directly from the user's browser (Zero server IP rate limits).
- * 2. Data Architecture (independent providers, tried in order, all with wisp fallback):
- *    - Primary encyclopedia: AniList GraphQL (https://graphql.anilist.co)
- *    - Fallback 1: MyAnimeList / Jikan v4 (https://api.jikan.moe/v4)
- *    - Fallback 2: Kitsu (https://kitsu.io/api/edge) — key-less, CORS-open, resolves
- *      MAL ids through the kitsu <-> myanimelist mappings so the rest of the site works unchanged
+ * 2. Data Architecture (all metadata from ONE source, with wisp fallback):
+ *    - ALL metadata: Kitsu (https://kitsu.io/api/edge) — key-less, CORS-open,
+ *      resolves MAL ids through the kitsu <-> myanimelist mappings so the rest
+ *      of the site works unchanged. Home, search, details, recent + schedule
+ *      all come from Kitsu now (AniList / Jikan were removed — they were the
+ *      slow, outage-prone legs of the old cascade).
  *    - Episodes & ID Mapping: AniZip (https://api.ani.zip/mappings)
- * 3. Crowdsourced Server Caching:
+ *    - Airing schedule: reanime.to (only live airing-time source; Kitsu has none)
+ *    - Stream: hls.js native, provider direct -> wisp fallback (wisp metadata only)
+ * 3. Honest source-chain console logs ("❌ [Source] failed (reason) — trying ..." /
+ *    "✅ [Source] downloaded (name, Xms)").
+ * 4. Crowdsourced Server Caching:
  *    - When a user fetches fresh data, it silently writes back to the server in the background.
  *    - FINISHED anime: 7 days TTL
- *    - RELEASING anime: 24 hours TTL
+ *    - RELEASING anime: 2 hours TTL
  *    - Next visitors get 10ms instantaneous cached load!
  */
 
 (function () {
-  const ANILIST_URL = 'https://graphql.anilist.co';
+  // (AniList GraphQL endpoint removed — Kitsu-only metadata.)
   const ANIZIP_URL = 'https://api.ani.zip/mappings';
-  const JIKAN_URL = 'https://api.jikan.moe/v4';
+  // (Jikan URL removed — Animetsu is Kitsu-only for all metadata.)
 
   const memCache = new Map();
   const pendingRequests = new Map();
@@ -270,29 +275,19 @@
   window.__anilist_auth_url = `https://anilist.co/api/v2/oauth/authorize?client_id=${anilistClientId}&response_type=token`;
 
 
-  // Rate-limit backoff flag (AniList 90 req/min safeguard)
-  let anilistRateLimitedUntil = 0;
-
   // =====================================================================
-  // Network resilience layer (v2.7)
+  // Network resilience layer (v2.11 — Kitsu-only metadata)
   // Stops repeated console 404/CORS storms by:
   //   1. Negative-caching AniZip "misses" so an impossible lookup is never
   //      retried (and never paired with a meaningless second probe).
-  //   2. Routing every Jikan call through a sequential queue with 429
-  //      backoff + timeout retries (kills "signal timed out" spam).
-  //   3. Backing off from a hard-down or CORS-blocked AniList endpoint and
-  //      retrying through the wisp tunnel instead of hammering it.
-  //   4. A wisp-only fallback path (no third-party CORS relays): direct
+  //   2. A wisp-only fallback path (no third-party CORS relays): direct
   //      fetch first, HTTP-over-wisp second, per-server failover.
+  //   Note: AniList/Jikan fetch machinery was removed — Kitsu serves all
+  //   anime metadata; ani.zip handles id mapping + episodes.
   // =====================================================================
-  let anilistNetBlockedUntil = 0;   // direct POST failed at network/CORS level
-  let anilistHttpFailUntil = 0;    // AniList API itself returned 403/5xx (e.g. "temporarily disabled")
-  let anilistWispFailUntil = 0;    // wisp-probe backoff during AniList outage (wisp retries at most once/min so the tunnel isn't flooded during a downtime)
-  const anilistFailUntilBySig = new Map(); // query signature -> retry-not-before ms
   const anizipMissCache = new Map();       // 'a'+id / 'm'+id -> retry-not-before ms (6h)
-  const jikanFailUntilByUrl = new Map();   // url -> retry-not-before ms (short)
   const pendingAnizipFetches = new Map();  // url -> in-flight promise
-  const malSourcedIds = new Set();         // ids verified to be MAL ids (from Jikan-sourced payloads)
+  const malSourcedIds = new Set();         // ids verified to be MAL ids (from ani.zip/Kitsu payloads)
 
   // --- Wisp fallback path (v2.7) ---
   // Last link of the chain: HTTP-over-wisp through the nano epoxy transport
@@ -460,6 +455,26 @@
     return mapKitsuList_(json).slice(0, limit);
   }
 
+  // All five home sections in one round (parallel requests). Shared by the
+  // AniList-outage fast path and the normal cascade at the end.
+  async function kitsuHomeSections() {
+    const [ktop, kpopular, kseasonal, ktrending, kupcoming] = await Promise.all([
+      kitsuList('top', 20),
+      kitsuList('popular', 20),
+      kitsuList('seasonal', 20),
+      kitsuList('trending', 15),
+      kitsuList('upcoming', 15)
+    ]);
+    const kanList = (ktop.length ? ktop : (kpopular.length ? kpopular : kseasonal));
+    return {
+      top: ktop.length ? ktop : kanList,
+      popular: kpopular.length ? kpopular : kanList,
+      seasonal: kseasonal.length ? kseasonal : kanList,
+      trending: ktrending.length ? ktrending : kanList.slice(0, 15),
+      upcoming: kupcoming.length ? kupcoming : kanList.slice(5, 20)
+    };
+  }
+
   // Kitsu text search (used as the third link of getClientSearch).
   async function kitsuSearch(query, page = 1, perPage = 20) {
     perPage = Math.min(perPage, 20); // Kitsu hard cap: 20 per page
@@ -577,67 +592,7 @@
     return info;
   }
 
-  // Launch a Jikan request while honouring their 3 req/s & 60 req/min limits.
-  // Serialises calls, backs off on 429 and retries timeouts with a longer window.
-  function jikanFetch(url, timeoutMs = 6500, attempts = 2) {
-    const failUntil = jikanFailUntilByUrl.get(url) || 0;
-    if (Date.now() < failUntil) {
-      return Promise.reject(new Error('Jikan recently failed for this endpoint (backoff window)'));
-    }
-    if (!jikanFetch._chain) jikanFetch._chain = Promise.resolve();
-    const run = jikanFetch._chain.then(async () => {
-      // enforce min spacing between Jikan calls (3 req/s limit)
-      const gap = Math.max(0, (jikanFetch._last || 0) + 360 - Date.now());
-      if (gap) await new Promise(r => setTimeout(r, gap));
-      jikanFetch._last = Date.now();
-
-      let lastErr = null;
-      for (let attempt = 0; attempt < attempts; attempt++) {
-        const timeout = timeoutMs + attempt * 2000;
-        try {
-          const controller = new AbortController();
-          const timer = setTimeout(() => controller.abort(), timeout);
-          const res = await originalFetch(url, { signal: controller.signal });
-          clearTimeout(timer);
-          if (res.status === 429) {
-            lastErr = new Error('Jikan rate limit (429)');
-            try { jikanFailUntilByUrl.set(url, Date.now() + Math.max((Number(res.headers.get('retry-after')) || 0) * 1000, 900)); } catch {}
-            await new Promise(r => setTimeout(r, 900));
-            continue;
-          }
-          return res;
-        } catch (err) {
-          lastErr = err;
-          if (attempt < attempts - 1) {
-            await new Promise(r => setTimeout(r, 450 + attempt * 350));
-          }
-        }
-      }
-      // All direct attempts failed (blocked network / CORS / timeouts):
-      // one last try through the wisp tunnel, still respecting the queue.
-      // Budget scales with the caller's own timeout so bulk home/category
-      // calls (5.5s) degrade fast instead of holding the page hostage for
-      // 14s each; standalone calls (14s budget) keep the full window.
-      if (wispAvailable()) {
-        try {
-          const wispBudget = Math.min(14000, Math.max(7000, timeoutMs + 3000));
-          const wRes = await wispFetch(url, {}, wispBudget);
-          if (wRes.status === 429) {
-            jikanFailUntilByUrl.set(url, Date.now() + 25000);
-            throw new Error('Jikan rate limit (429 via wisp)');
-          }
-          console.debug('[ClientEngine] Jikan recovered via wisp:', url);
-          return wRes;
-        } catch (wispErr) {
-          lastErr = wispErr;
-        }
-      }
-      jikanFailUntilByUrl.set(url, Date.now() + 25000);
-      throw lastErr || new Error('Jikan unreachable');
-    });
-    jikanFetch._chain = run.catch(() => {}); // keep queue alive after failures
-    return run;
-  }
+  // (Jikan fetch removed — Animetsu is Kitsu-only for all metadata.)
 
   // Wrap every ani.zip /mappings probe:
   //   - dedupes identical in-flight requests,
@@ -843,148 +798,11 @@
     return promise;
   }
 
-  async function queryAniList(query, variables = {}, timeoutMs = 8000) {
-    const now = Date.now();
-    if (now < anilistRateLimitedUntil) {
-      console.warn('⚠️ [ClientEngine] AniList cooldown active (rate-limited). Skipping query to protect IP.');
-      return null;
-    }
-
-    // Per-query negative cache: identical queries that failed recently are
-    // short-circuited so repeated renders don't spam the network or console.
-    const sig = String(query).slice(0, 160).replace(/\s+/g, ' ') + '::' + JSON.stringify(variables || {});
-    if (now < (anilistFailUntilBySig.get(sig) || 0)) return null;
-    // Hard-down / blocked endpoint: skip the direct attempt entirely (it would
-    // only produce browser CORS errors); the wisp attempts below still run.
-    const hardBlocked = (now < anilistHttpFailUntil) || (now < anilistNetBlockedUntil);
-
-    let lastErr = null;
-
-    // 1. Direct fetch (the browser's CORS still applies; AniList normally allows any origin)
-    if (!hardBlocked) {
-      try {
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), timeoutMs);
-        const res = await originalFetch(ANILIST_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-          },
-          body: JSON.stringify({ query, variables }),
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-        if (res.status === 429) {
-          console.warn('⚠️ [ClientEngine] AniList returned HTTP 429 (Too Many Requests)! Cooling down for 60 seconds.');
-          anilistRateLimitedUntil = Date.now() + 60000;
-          throw new Error('AniList HTTP 429 Rate Limit');
-        }
-        if (!res.ok) {
-          // e.g. AniList API outage (403 "temporarily disabled"), 5xx, etc.
-          anilistHttpFailUntil = Date.now() + 5 * 60 * 1000;
-          throw new Error(`AniList HTTP ${res.status}`);
-        }
-        const json = await res.json();
-        if (json.errors && json.errors.length) {
-          throw new Error(json.errors[0]?.message || 'AniList GraphQL error');
-        }
-        return json?.data || null;
-      } catch (err) {
-        lastErr = err;
-        const timedOut = err && String(err.name || err.message || '').toLowerCase().includes('abort');
-        if (!timedOut && (String(err.message || '')).includes('Failed to fetch')) {
-          // network/CORS level failure -> don't repeat the un-proxied attempt for a while
-          anilistNetBlockedUntil = Date.now() + 4 * 60 * 1000;
-        }
-      }
-    } else {
-      lastErr = new Error('AniList endpoint in backoff window');
-    }
-
-    // 2. Wisp tunnel (wisp protocol over a single multiplexed WebSocket —
-    //    truffled.lol first, mercurywork.shop second). Bypasses CORS and wifi
-    //    filters entirely; WebSocket connects where fetch() cannot.
-    //    During an AniList outage (403/5xx) the probe is rate-limited to
-    //    once per minute so downtime doesn't flood the shared tunnel with
-    //    doomed requests — the "wisp is slow" effect.
-    const body = { query, variables };
-    const wispProbeAllowed = Date.now() >= anilistWispFailUntil;
-    if (wispAvailable() && wispProbeAllowed) {
-      let wispOutage = false;
-      // 2a. POST-mode (native GraphQL endpoint through wisp)
-      try {
-        const wRes = await wispFetch(ANILIST_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', 'Accept': 'application/json' },
-          body: JSON.stringify(body)
-        }, 9000);
-        if (wRes.ok) {
-          const wJson = await wRes.json();
-          if (wJson && !wJson.errors && wJson?.data) {
-            // tunnel worked: clear the hard-block windows
-            anilistRateLimitedUntil = 0;
-            anilistNetBlockedUntil = 0;
-            anilistHttpFailUntil = 0;
-            anilistWispFailUntil = 0;
-            return wJson.data || null;
-          }
-        } else if (wRes.status === 429) {
-          anilistRateLimitedUntil = Date.now() + 60000;
-        } else if (wRes.status === 403 || wRes.status >= 500) {
-          wispOutage = true; // AniList itself is down; wisp is fine
-        } else if (wRes.status >= 400) {
-          const b = await wRes.text().catch(() => '');
-          if (!b.trim()) wispOutage = true;
-        }
-      } catch {}
-      // 2b. GET-mode (some wisp backends mangle POST bodies; GET never does)
-      if (!wispOutage) {
-        try {
-          const wRes = await wispFetch(
-            ANILIST_URL + '?query=' + encodeURIComponent(body.query) +
-            (body.variables ? '&variables=' + encodeURIComponent(JSON.stringify(body.variables)) : ''),
-            {}, 9000
-          );
-          if (wRes.ok) {
-            const wJson = await wRes.json();
-            if (wJson && !wJson.errors && wJson?.data) {
-              anilistRateLimitedUntil = 0;
-              anilistNetBlockedUntil = 0;
-              anilistHttpFailUntil = 0;
-              anilistWispFailUntil = 0;
-              return wJson.data || null;
-            }
-          } else if (wRes.status === 403 || wRes.status >= 500) {
-            wispOutage = true;
-          }
-        } catch {}
-      }
-      if (wispOutage) {
-        // Outage confirmed through the tunnel: probe again in 1 minute.
-        if (!anilistHttpFailUntil) anilistHttpFailUntil = Date.now() + 60 * 1000;
-        anilistWispFailUntil = Date.now() + 60 * 1000;
-        console.warn('[ClientEngine] AniList down (probe via wisp got an outage response) — wisp probe paused 60s.');
-        anilistFailUntilBySig.set(sig, Date.now() + 15000);
-        return null;
-      }
-    }
-
-    anilistFailUntilBySig.set(sig, Date.now() + 15000); // don't re-attempt this exact query for 15s
-    console.warn(`[ClientEngine] AniList failed (${(lastErr && lastErr.message) || 'unreachable'}). Falling back to MAL (Jikan)...`);
-    return null;
-  }
+  // (AniList GraphQL fetch removed — Animetsu is Kitsu-only for all metadata.)
 
   function getHdCover(url) {
     if (!url || typeof url !== 'string') return url || '';
     return url.replace('/cover/medium/', '/cover/large/').replace('/cover/small/', '/cover/large/');
-  }
-
-  function formatAniListDate(d) {
-    if (!d || !d.year) return null;
-    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    if (d.month) return `${months[d.month - 1]} ${d.day || ''}, ${d.year}`.replace(' ,', ',');
-    return String(d.year);
   }
 
   // Crowdsourced VPS Caching: Writes fresh pure AniList data back to VPS Cache Shield
@@ -1079,428 +897,9 @@
     return numericId;
   }
 
-  // 1. Build clean franchise seasons (Only real TV seasons & direct canon)
-  function extractCleanSeasons(rootMedia) {
-    if (!rootMedia) return [];
-    const seasonsMap = new Map();
-    seasonsMap.set(rootMedia.id, rootMedia);
-
-    const RECAP_WORDS = ['recap', 'compilation', 'special edition', 'remix', 'reawakening', 'beyond the system'];
-    const EXCLUDED_TITLES = ['monsters: 103 mercies', 'no regrets', 'the one piece'];
-
-    function checkAndAdd(node, relType) {
-      if (!node || node.type === 'MANGA') return;
-      if (relType !== 'PREQUEL' && relType !== 'SEQUEL') return;
-
-      const title = `${node.title?.english || ''} ${node.title?.romaji || ''}`.toLowerCase();
-      if (RECAP_WORDS.some(w => title.includes(w))) return;
-      if (EXCLUDED_TITLES.some(w => title.includes(w))) return;
-      if (['MUSIC', 'MANGA', 'NOVEL', 'ONE_SHOT'].includes(node.format)) return;
-
-      if (!seasonsMap.has(node.id)) {
-        seasonsMap.set(node.id, node);
-      }
-    }
-
-    // Traverse up to 3 depths of prequel/sequel
-    for (const e1 of rootMedia.relations?.edges || []) {
-      checkAndAdd(e1.node, e1.relationType);
-      for (const e2 of e1.node?.relations?.edges || []) {
-        checkAndAdd(e2.node, e2.relationType);
-        for (const e3 of e2.node?.relations?.edges || []) {
-          checkAndAdd(e3.node, e3.relationType);
-        }
-      }
-    }
-
-    const list = Array.from(seasonsMap.values());
-    list.sort((a, b) => {
-      const yA = a.startDate?.year || a.seasonYear || 0;
-      const yB = b.startDate?.year || b.seasonYear || 0;
-      if (yA !== yB) return yA - yB;
-      const mA = a.startDate?.month || 0;
-      const mB = b.startDate?.month || 0;
-      if (mA !== mB) return mA - mB;
-      return (a.startDate?.day || 0) - (b.startDate?.day || 0);
-    });
-
-    let tvIndex = 0;
-    return list.map(m => {
-      const isTv = m.format === 'TV' || m.format === 'TV_SHORT';
-      const title = `${m.title?.english || ''} ${m.title?.romaji || ''}`.toLowerCase();
-      let rel = isTv ? `Season ${++tvIndex}` : (m.format || 'Special');
-
-      if (title.includes('final season')) {
-        if (title.includes('final chapters') || title.includes('part 3')) rel = 'Final Season Part 3';
-        else if (title.includes('part 2')) rel = 'Final Season Part 2';
-        else rel = 'Final Season';
-      } else if (title.includes('season 4') || title.includes('4th season')) {
-        rel = title.includes('part 2') || title.includes('cour 2') ? 'Season 4 Part 2' : 'Season 4';
-      } else if (title.includes('season 3') || title.includes('3rd season')) {
-        rel = title.includes('part 2') || title.includes('cour 2') ? 'Season 3 Part 2' : 'Season 3';
-      } else if (title.includes('season 2') || title.includes('2nd season')) {
-        rel = title.includes('part 2') || title.includes('cour 2') ? 'Season 2 Part 2' : 'Season 2';
-      } else if (title.includes('season 1') || title.includes('1st season')) {
-        rel = 'Season 1';
-      }
-
-      const cover = getHdCover(m.coverImage?.extraLarge || m.coverImage?.large || m.coverImage?.medium || '');
-      return {
-        id: String(m.id),
-        anilist_id: m.id,
-        title: m.title || { english: 'Untitled', romaji: 'Untitled' },
-        format: m.format || 'TV',
-        season: m.season || 'FALL',
-        year: m.startDate?.year || m.seasonYear || 2024,
-        type: 'anime',
-        total_eps: m.episodes || 12,
-        status: m.status || 'FINISHED',
-        genres: m.genres || [],
-        duration: m.duration || 24,
-        average_score: m.averageScore || 70,
-        description: (m.description || '').replace(/<[^>]*>?/gm, ''),
-        cover_image: { large: cover, medium: cover, small: cover },
-        img: cover,
-        poster: cover,
-        banner: m.bannerImage || cover,
-        trailer: typeof m.trailer === 'string' ? m.trailer : (m.trailer?.id || ''),
-        relation: rel,
-        relation_type: rel
-      };
-    });
-  }
-
-  // Normalize AniList Media into Animetsu OG Schema
-  function normalizeAniListMedia(m) {
-    if (!m) return null;
-    const cover = getHdCover(m.coverImage?.extraLarge || m.coverImage?.large || m.coverImage?.medium || '');
-    const banner = m.bannerImage || cover;
-
-    // Filter relations: ANIME ONLY
-    const relations = (m.relations?.edges || [])
-      .filter(edge => {
-        const node = edge?.node;
-        if (!node) return false;
-        if (node.type && node.type !== 'ANIME') return false;
-        if (['MANGA', 'NOVEL', 'ONE_SHOT', 'MUSIC'].includes(node.format)) return false;
-        if (['ADAPTATION', 'SOURCE', 'CHARACTER'].includes(edge.relationType)) return false;
-        return true;
-      })
-      .map(edge => {
-        const node = edge.node;
-        const relCover = getHdCover(node.coverImage?.extraLarge || node.coverImage?.large || node.coverImage?.medium || '');
-        return {
-          id: String(node.id),
-          anilist_id: node.id,
-          relation_type: edge.relationType || 'RELATED',
-          title: node.title || { english: 'Untitled', romaji: 'Untitled' },
-          format: node.format || 'TV',
-          status: node.status || 'FINISHED',
-          year: node.seasonYear || (node.startDate?.year) || null,
-          type: 'anime',
-          cover_image: { extraLarge: relCover, large: relCover, medium: relCover, small: relCover },
-          img: relCover,
-          poster: relCover,
-          banner: node.bannerImage || relCover
-        };
-      });
-
-    // Filter recommendations: ANIME ONLY
-    const recommendations = (m.recommendations?.nodes || [])
-      .map(rec => rec?.mediaRecommendation)
-      .filter(node => node && node.type === 'ANIME' && !['MANGA', 'NOVEL', 'ONE_SHOT'].includes(node.format))
-      .map(node => {
-        const recCover = getHdCover(node.coverImage?.extraLarge || node.coverImage?.large || node.coverImage?.medium || '');
-        return {
-          id: String(node.id),
-          anilist_id: node.id,
-          title: node.title || { english: 'Untitled', romaji: 'Untitled' },
-          format: node.format || 'TV',
-          status: node.status || 'FINISHED',
-          year: node.seasonYear || (node.startDate?.year) || null,
-          average_score: node.averageScore || 0,
-          type: 'anime',
-          cover_image: { extraLarge: recCover, large: recCover, medium: recCover, small: recCover },
-          img: recCover,
-          poster: recCover,
-          banner: node.bannerImage || recCover
-        };
-      });
-
-    const characters = (m.characters?.edges || []).map(edge => ({
-      name: edge.node?.name?.full || 'Character',
-      image: edge.node?.image?.large || edge.node?.image?.medium || '',
-      role: edge.role || 'SUPPORTING',
-      voice_actor: edge.voiceActors?.[0] ? {
-        name: edge.voiceActors[0].name?.full || '',
-        image: edge.voiceActors[0].image?.large || edge.voiceActors[0].image?.medium || '',
-        language: edge.voiceActors[0].language || 'Japanese'
-      } : null
-    }));
-
-    const staff = (m.staff?.edges || []).map(edge => ({
-      name: edge.node?.name?.full || '',
-      image: edge.node?.image?.large || edge.node?.image?.medium || '',
-      role: edge.role || ''
-    }));
-
-    const seasons = extractCleanSeasons(m);
-    const yr = m.seasonYear || m.startDate?.year || 2024;
-
-    return {
-      id: String(m.id),
-      anilist_id: m.id,
-      mal_id: m.idMal || null,
-      type: 'anime',
-      title: {
-        english: m.title?.english || m.title?.romaji || m.title?.native || 'Untitled',
-        romaji: m.title?.romaji || m.title?.english || 'Untitled',
-        native: m.title?.native || ''
-      },
-      format: m.format || 'TV',
-      season: m.season || 'FALL',
-      year: yr,
-      status: m.status || 'FINISHED',
-      genres: m.genres || [],
-      total_eps: m.episodes || 12,
-      duration: m.duration || 24,
-      average_score: m.averageScore || 75,
-      mean_score: m.averageScore || 75,
-      description: (m.description || '').replace(/<[^>]*>?/gm, ''),
-      banner: banner,
-      banner_image: banner,
-      poster: cover,
-      img: cover,
-      cover_image: { extraLarge: cover, large: cover, medium: cover, small: cover },
-      studio: m.studios?.nodes?.[0]?.name || '',
-      studios: (m.studios?.nodes || []).map(n => ({ name: n.name })),
-      color: m.coverImage?.color || '#e4ae5d',
-      source: m.source || 'ORIGINAL',
-      next_airing_ep: m.nextAiringEpisode ? {
-        airing_at: m.nextAiringEpisode.airingAt,
-        time_until_airing: m.nextAiringEpisode.timeUntilAiring,
-        ep_num: m.nextAiringEpisode.episode
-      } : null,
-      start_date: formatAniListDate(m.startDate),
-      end_date: formatAniListDate(m.endDate),
-      trailer: typeof m.trailer === 'string' ? m.trailer : (m.trailer?.id || ''),
-      seasons,
-      characters,
-      relations,
-      recommendations,
-      staff,
-      rank: (() => {
-        if (Array.isArray(m.rankings)) {
-          const popR = m.rankings.find(r => !r.allTime && r.type === 'POPULAR' && r.rank > 0 && r.rank <= 100)
-            || m.rankings.find(r => !r.allTime && r.rank > 0 && r.rank <= 100)
-            || m.rankings.find(r => r.rank > 0 && r.rank <= 100);
-          if (popR) return popR.rank;
-        }
-        if (typeof m.trending === 'number' && m.trending > 0 && m.trending <= 100) return m.trending;
-        const pop = Number(m.popularity || 0);
-        return pop > 80000 ? 5 : pop > 40000 ? 8 : pop > 20000 ? 12 : pop > 5000 ? 24 : 8;
-      })(),
-      users: m.popularity || 1500,
-      popularity: m.popularity || 50000,
-      favourites: m.favourites || 1000
-    };
-  }
-
-  // Query AniList directly from user's browser
-  async function queryAniListDirect(animeId) {
-    const query = `
-      query ($id: Int) {
-        Media(id: $id, type: ANIME) {
-          id
-          idMal
-          title { english romaji native }
-          format
-          status
-          season
-          seasonYear
-          averageScore
-          meanScore
-          popularity
-          favourites
-          duration
-          episodes
-          genres
-          source
-          description(asHtml: false)
-          bannerImage
-          coverImage { extraLarge large medium color }
-          startDate { year month day }
-          endDate { year month day }
-          studios(isMain: true) { nodes { name } }
-          trailer { id }
-          trending
-          rankings { rank type allTime context }
-          nextAiringEpisode { airingAt timeUntilAiring episode }
-          characters(sort: ROLE, perPage: 25) {
-            edges {
-              role
-              node { name { full } image { large medium } }
-              voiceActors(language: JAPANESE) { name { full } image { large medium } language }
-            }
-          }
-          relations {
-            edges {
-              relationType
-              node {
-                id
-                title { english romaji native }
-                format
-                type
-                status
-                seasonYear
-                startDate { year }
-                coverImage { extraLarge large medium }
-                bannerImage
-              }
-            }
-          }
-          recommendations(perPage: 15, sort: RATING_DESC) {
-            nodes {
-              mediaRecommendation {
-                id
-                title { english romaji native }
-                format
-                type
-                status
-                seasonYear
-                averageScore
-                coverImage { extraLarge large medium }
-              }
-            }
-          }
-          staff(perPage: 8) {
-            edges {
-              role
-              node { name { full } image { large medium } }
-            }
-          }
-        }
-      }
-    `;
-
-    const data = await queryAniList(query, { id: Number(animeId) });
-    if (data?.Media) {
-      const normalized = normalizeAniListMedia(data.Media);
-      if (normalized?.mal_id) {
-        anilistToMalCache.set(Number(animeId), Number(normalized.mal_id));
-      }
-      return normalized;
-    }
-    return null;
-  }
-
-  async function queryJikanFallback(animeId, resolvedAnilistId) {
-    const anilistId = resolvedAnilistId || (await getAnilistIdFromMalId(animeId));
-    const numericId = Number(animeId);
-
-    // Never feed an unverified AniList id to Jikan as if it were a MAL id:
-    // it can 404 (excess error spam) or, worse, return the WRONG anime.
-    // Only call Jikan with an id that is proven to belong to MAL.
-    let malId = null;
-    if (malSourcedIds.has(String(numericId))) {
-      malId = numericId;
-      console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId}, AniList: ${anilistId})`);
-    } else {
-      const resolved = await resolveAniZipMappings(numericId);
-      if (resolved.matchedBy === 'anilist' && Number(resolved.malId)) {
-        malId = Number(resolved.malId);
-        console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId} via ani.zip, AniList: ${anilistId})`);
-      } else if (resolved.matchedBy === 'mal' && Number(resolved.malId) === numericId) {
-        malId = numericId;
-        console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId}, AniList: ${anilistId})`);
-      } else if (resolved.json?.mappings?.animeplanet_id) {
-        // Last resort: search Jikan by the ani.zip animeplanet slug
-        const slug = String(resolved.json.mappings.animeplanet_id).replace(/[-_]+/g, ' ').trim();
-        try {
-          const sRes = await jikanFetch(`${JIKAN_URL}/anime?q=${encodeURIComponent(slug)}&limit=3`, 5000, 1);
-          if (sRes.ok) {
-            const sJson = await sRes.json();
-            const hit = (sJson?.data || [])[0];
-            if (hit?.mal_id) {
-              malId = Number(hit.mal_id);
-              console.log(`🔄 [ClientEngine] Trying Fallback 1: Jikan (MAL: ${malId} via slug search, AniList: ${anilistId})`);
-            }
-          }
-        } catch {}
-      }
-    }
-
-    if (!malId) {
-      throw new Error(`No MAL mapping available for AniList ID ${animeId}`);
-    }
-
-    // Query Jikan (queue + rate-limit + timeout aware)
-    const res = await jikanFetch(`${JIKAN_URL}/anime/${malId}/full`, 7000, 2);
-    if (!res.ok) throw new Error(`Jikan HTTP ${res.status}`);
-    const json = await res.json();
-    const d = json?.data;
-    if (!d) throw new Error('Jikan empty data');
-
-    const cover = d.images?.webp?.large_image_url || d.images?.jpg?.large_image_url || '';
-    const banner = cover;
-
-    return {
-      id: String(animeId),
-      anilist_id: Number(anilistId),
-      mal_id: d.mal_id,
-      type: 'anime',
-      title: {
-        english: d.title_english || d.title || 'Untitled',
-        romaji: d.title || d.title_japanese || 'Untitled',
-        native: d.title_japanese || ''
-      },
-      format: (d.type || 'TV').toUpperCase(),
-      season: (d.season || 'SUMMER').toUpperCase(),
-      year: d.year || (d.aired?.prop?.from?.year) || new Date().getFullYear(),
-      status: d.status === 'Currently Airing' ? 'RELEASING' : (d.status === 'Not yet aired' ? 'NOT_YET_RELEASED' : 'FINISHED'),
-      genres: (d.genres || []).map(g => g.name),
-      total_eps: d.episodes || 12,
-      duration: parseInt(d.duration) || 24,
-      average_score: Math.round((d.score || 7.5) * 10),
-      mean_score: Math.round((d.score || 7.5) * 10),
-      description: (d.synopsis || '').replace(/\[Written by MAL Rewrite\]/g, '').trim(),
-      banner: banner,
-      banner_image: banner,
-      poster: cover,
-      img: cover,
-      cover_image: { extraLarge: cover, large: cover, medium: cover, small: cover },
-      studio: d.studios?.[0]?.name || '',
-      studios: (d.studios || []).map(s => ({ name: s.name })),
-      color: '#e4ae5d',
-      source: d.source || 'MANGA',
-      start_date: d.aired?.string || '',
-      end_date: '',
-      trailer: d.trailer?.youtube_id || '',
-      seasons: [
-        {
-          id: String(animeId),
-          anilist_id: Number(anilistId),
-          mal_id: d.mal_id,
-          title: { english: d.title_english || d.title, romaji: d.title },
-          format: d.type || 'TV',
-          relation: 'Season 1',
-          relation_type: 'Season 1',
-          cover_image: { large: cover, medium: cover, small: cover },
-          img: cover
-        }
-      ],
-      characters: [],
-      relations: [],
-      recommendations: [],
-      staff: [],
-      rank: (d.rank && d.rank <= 100) ? d.rank : 8,
-      popularity: d.popularity || 1000
-    };
-  }
-
-  // Anime Info Fetcher: AniList Primary + MAL (Jikan v4) Fallback
+  // Anime Info Fetcher (Kitsu-primary — the only metadata source)
   // (Non-numeric ids — SPA route artifacts like "watch", "anime" — are
-  // rejected instantly instead of becoming junk ani.zip/Jikan/Kitsu calls.)
+  // rejected instantly instead of becoming junk ani.zip/Kitsu calls.)
   async function getClientAnimeInfo(animeId) {
     if (!/^\d+$/.test(String(animeId || ''))) return null;
     const cacheKey = `animetsu_info_${animeId}`;
@@ -1511,8 +910,8 @@
       return cached;
     }
 
-    // Failure backoff: if both providers failed for this id in the last 2 min,
-    // don't re-fire the network storm — serve stale/persistedLastResort instantly.
+    // Failure backoff: if Kitsu failed for this id in the last 2 min,
+    // don't re-fire the network — serve stale instantly.
     if (Date.now() < (memCache.get(`info_fail_${animeId}`) || 0)) {
       const staleFail = getStaleCachedItem(cacheKey, 'local');
       if (staleFail && staleFail.id) return staleFail;
@@ -1520,80 +919,66 @@
     }
 
     return dedupeRequest(`info_${animeId}`, async () => {
-      // 1. Primary: AniList Direct Browser Fetch (Zero backend calls)
-      try {
-        console.log(`🌐 [ClientEngine] Fetching AniList Info for ID: ${animeId} (Primary)`);
-        const aniInfo = await queryAniListDirect(animeId);
-        if (aniInfo && aniInfo.id) {
-          try {
-            const logo = await getAnimeLogo(aniInfo.anilist_id || aniInfo.id);
-            if (logo) aniInfo.clear_logo = logo;
-          } catch (e) {}
+      const numericId = Number(animeId);
+      const t0 = Date.now();
 
-          const isFinished = aniInfo.status === 'FINISHED';
-          const ttl = isFinished ? (7 * 24 * 60 * 60 * 1000) : (12 * 60 * 60 * 1000); // 7 days finished, 12 hours ongoing
-          setCachedItem(cacheKey, aniInfo, ttl, 'local');
-          writeBackToServer('info', animeId, aniInfo);
-          return aniInfo;
+      // ------------------------------------------------------------------
+      // PRIMARY (and only source): Kitsu.
+      // Step 1 — resolve the MAL id via ani.zip (fast key-less direct
+      //          lookup, negative-cached; both id directions supported).
+      // Step 2 — pull the full detail object from Kitsu by MAL id.
+      // AniList/Jikan are never contacted for metadata anymore.
+      // ------------------------------------------------------------------
+      let malId = null;
+      let anilistId = 0;
+      try {
+        if (malSourcedIds.has(String(numericId))) {
+          malId = numericId;
+        } else {
+          const rz = await resolveAniZipMappings(numericId);
+          if (rz.matchedBy === 'anilist' && Number(rz.malId)) malId = Number(rz.malId);
+          else if (rz.matchedBy === 'mal' && Number(rz.malId) === numericId) malId = numericId;
+          if (Number(rz.anilistId)) anilistId = Number(rz.anilistId);
         }
-      } catch (e0) {
-        console.warn(`⚠️ [ClientEngine] AniList direct info failed: ${e0.message}`);
+      } catch (eMap) {
+        console.warn(`❌ [AniZip] id mapping failed (${eMap.message}) — Kitsu skipped.`);
       }
 
-      // 2. Fallback: MyAnimeList via Jikan API v4
-      const anilistId = await getAnilistIdFromMalId(animeId);
-      try {
-        console.log(`🔄 [ClientEngine] Fallback to MAL (Jikan) for ID: ${animeId} (AniList ID: ${anilistId})`);
-        const malInfo = await queryJikanFallback(animeId, anilistId);
-        if (malInfo && malInfo.id) {
-          const isReleasing = malInfo.status === 'RELEASING' || malInfo.status === 'NOT_YET_RELEASED';
-          const ttl = isReleasing ? (2 * 60 * 60 * 1000) : (7 * 24 * 60 * 60 * 1000);
-          setCachedItem(cacheKey, malInfo, ttl, 'local');
-          // Note: Never writeBackToServer for MAL; CDN cache is reserved strictly for pure AniList data
-          return malInfo;
-        }
-      } catch (e1) {
-        console.warn(`⚠️ [ClientEngine] Jikan fallback failed: ${e1.message}`);
-      }
-
-      // 2b. Fallback 2: Kitsu detail by MAL id (direct -> wisp)
-      try {
-        const resolvedBefore = await getAnilistIdFromMalId(animeId);
-        let kMalId = null;
-        if (malSourcedIds.has(String(Number(animeId)))) kMalId = Number(animeId);
-        if (!kMalId) {
-          const rz = await resolveAniZipMappings(Number(animeId));
-          if (rz.matchedBy === 'anilist' && Number(rz.malId)) kMalId = Number(rz.malId);
-          else if (rz.matchedBy === 'mal' && Number(rz.malId) === Number(animeId)) kMalId = Number(animeId);
-        }
-        if (kMalId) {
-          console.log(`🔄 [ClientEngine] Trying Fallback 2: Kitsu (MAL: ${kMalId}, AniList: ${animeId})`);
-          const kitsuInfo = await kitsuInfoByMal(kMalId, anilistId, animeId);
+      if (malId) {
+        try {
+          console.log(`🟣 [Kitsu] fetching details (MAL: ${malId}, AniList: ${anilistId || numericId})...`);
+          const kitsuInfo = await kitsuInfoByMal(malId, anilistId, animeId);
           if (kitsuInfo && kitsuInfo.id) {
-            const isReleasing2 = kitsuInfo.status === 'RELEASING' || kitsuInfo.status === 'NOT_YET_RELEASED';
-            const ttl2 = isReleasing2 ? (2 * 60 * 60 * 1000) : (7 * 24 * 60 * 60 * 1000);
-            setCachedItem(cacheKey, kitsuInfo, ttl2, 'local');
-            // Note: Never writeBackToServer for Kitsu either; CDN cache stays AniList-only.
+            console.log(`✅ [Kitsu] details downloaded (${kitsuInfo.title?.english || kitsuInfo.title?.romaji || 'anime'}, ${Date.now() - t0}ms)`);
+            try {
+              const logo = await getAnimeLogo(anilistId || numericId);
+              if (logo) kitsuInfo.clear_logo = logo;
+            } catch (e) {}
+            const isReleasing = kitsuInfo.status === 'RELEASING' || kitsuInfo.status === 'NOT_YET_RELEASED';
+            const ttl = isReleasing ? (2 * 60 * 60 * 1000) : (7 * 24 * 60 * 60 * 1000);
+            setCachedItem(cacheKey, kitsuInfo, ttl, 'local');
             return kitsuInfo;
           }
+        } catch (eKitsu) {
+          console.warn(`❌ [Kitsu] details failed (${eKitsu.message})`);
         }
-      } catch (eKitsu) {
-        console.warn(`⚠️ [ClientEngine] Kitsu fallback failed: ${eKitsu.message}`);
+      } else {
+        console.warn(`❌ [AniZip] no id mapping for ${numericId} — Kitsu skipped.`);
       }
 
-      // 3. Stale fallback from persistent storage
+      // 2. Stale fallback from persistent storage
       const stale = getStaleCachedItem(cacheKey, 'local');
       if (stale && stale.id) return stale;
 
-      // Both sources failed: start the short backoff window for this id so the
-      // next render doesn't replay the whole failing cascade.
+      // Kitsu failed: start the short backoff window for this id so the
+      // next render doesn't replay the failing lookup.
       memCache.set(`info_fail_${animeId}`, Date.now() + 2 * 60 * 1000);
 
       // Final fallback object
       return {
         id: String(animeId),
-        anilist_id: Number(anilistId),
-        mal_id: Number(animeId),
+        anilist_id: anilistId || numericId,
+        mal_id: malId || numericId,
         title: { english: 'Anime', romaji: 'Anime' },
         status: 'FINISHED',
         format: 'TV',
@@ -1697,99 +1082,61 @@
       }
     }
 
-    // Direct AniList GraphQL Fallback if AniZip returned 0 episodes
+    // Fallback (Kitsu-only): when ani.zip has no episode data, synthesize a
+    // plain "Episode 1..N" list from the episode COUNT reported by
+    // (a) the locally cached info object, or (b) a fresh Kitsu lookup via
+    // the ani.zip MAL mapping. No AniList/Jikan contacted.
     try {
-      const targetAniId = Number(anilistId || animeId);
-      if (targetAniId && !isNaN(targetAniId)) {
-        console.log(`🌐 [ClientEngine] Fallback to AniList GraphQL for ID: ${targetAniId}`);
-        const aniQuery = `
-          query ($id: Int) {
-            Media(id: $id, type: ANIME) {
-              id
-              format
-              status
-              episodes
-              duration
-              bannerImage
-              coverImage { extraLarge large medium }
-              nextAiringEpisode { episode airingAt }
-              streamingEpisodes { title thumbnail }
-            }
-          }
-        `;
-        const aniData = await queryAniList(aniQuery, { id: targetAniId }, 5000);
-        if (aniData) {
-          const media = aniData?.Media;
-          if (media) {
-            const fallbackImg = media.bannerImage || media.coverImage?.extraLarge || media.coverImage?.large || defaultImg || '';
-            const fallbackEpisodes = [];
+      const t1 = Date.now();
+      let synCount = 0;
 
-            if (Array.isArray(media.streamingEpisodes) && media.streamingEpisodes.length > 0) {
-              media.streamingEpisodes.forEach((sep, idx) => {
-                const epNum = idx + 1;
-                const cleanName = sep.title || `Episode ${epNum}`;
-                let viewsCount = 0;
-                try {
-                  const cachedViews = localStorage.getItem(`animetsu_real_views_${animeId}_${epNum}`);
-                  if (cachedViews !== null) viewsCount = Number(cachedViews) || 0;
-                } catch {}
-                fallbackEpisodes.push({
-                  id: `${targetAniId}-${epNum}`,
-                  ep_num: epNum,
-                  name: cleanName,
-                  img: sep.thumbnail || fallbackImg,
-                  desc: `Episode ${epNum}`,
-                  aired_at: '',
-                  runtime: media.duration || 24,
-                  views: viewsCount,
-                  likes: 0,
-                  dislikes: 0,
-                  is_filler: false
-                });
-              });
-            } else {
-              let epCount = 1;
-              if (media.status === 'RELEASING' && media.nextAiringEpisode?.episode) {
-                epCount = Math.max(1, media.nextAiringEpisode.episode - 1);
-              } else if (media.episodes) {
-                epCount = Number(media.episodes);
-              } else if (media.format === 'MOVIE') {
-                epCount = 1;
-              } else {
-                epCount = 12;
-              }
+      const cachedInfoObj = getStaleCachedItem(`animetsu_info_${animeId}`, 'local');
+      if (cachedInfoObj && Number(cachedInfoObj.total_eps)) synCount = Number(cachedInfoObj.total_eps);
 
-              for (let epNum = 1; epNum <= epCount; epNum++) {
-                let viewsCount = 0;
-                try {
-                  const cachedViews = localStorage.getItem(`animetsu_real_views_${animeId}_${epNum}`);
-                  if (cachedViews !== null) viewsCount = Number(cachedViews) || 0;
-                } catch {}
-                fallbackEpisodes.push({
-                  id: `${targetAniId}-${epNum}`,
-                  ep_num: epNum,
-                  name: `Episode ${epNum}`,
-                  img: fallbackImg,
-                  desc: `Episode ${epNum}`,
-                  aired_at: '',
-                  runtime: media.duration || 24,
-                  views: viewsCount,
-                  likes: 0,
-                  dislikes: 0,
-                  is_filler: false
-                });
-              }
-            }
-
-            if (fallbackEpisodes.length > 0) {
-              setCachedItem(cacheKey, fallbackEpisodes, 4 * 60 * 60 * 1000, 'local');
-              return fallbackEpisodes;
-            }
-          }
+      if (synCount < 1) {
+        let synMalId = null;
+        if (malSourcedIds.has(String(Number(animeId)))) {
+          synMalId = Number(animeId);
+        } else {
+          const rzE = await resolveAniZipMappings(Number(animeId));
+          if (rzE.matchedBy === 'anilist' && Number(rzE.malId)) synMalId = Number(rzE.malId);
+          else if (rzE.matchedBy === 'mal' && Number(rzE.malId) === Number(animeId)) synMalId = Number(animeId);
+        }
+        if (synMalId) {
+          console.log(`🟣 [Kitsu] fetching episode count (MAL: ${synMalId})...`);
+          const kInfo = await kitsuInfoByMal(synMalId, anilistId, animeId);
+          if (kInfo && Number(kInfo.total_eps)) synCount = Number(kInfo.total_eps);
         }
       }
-    } catch (eAni) {
-      console.warn('[ClientEngine] AniList episodes fallback error:', eAni);
+
+      if (synCount > 0) {
+        const cachedEpisodes = [];
+        for (let epNum = 1; epNum <= Math.min(synCount, 1200); epNum++) {
+          let viewsCount = 0;
+          try {
+            const cachedViews = localStorage.getItem(`animetsu_real_views_${animeId}_${epNum}`);
+            if (cachedViews !== null) viewsCount = Number(cachedViews) || 0;
+          } catch {}
+          cachedEpisodes.push({
+            id: `${anilistId || animeId}-${epNum}`,
+            ep_num: epNum,
+            name: `Episode ${epNum}`,
+            img: defaultImg,
+            desc: `Episode ${epNum}`,
+            aired_at: '',
+            runtime: (cachedInfoObj && cachedInfoObj.duration) || 24,
+            views: viewsCount,
+            likes: 0,
+            dislikes: 0,
+            is_filler: false
+          });
+        }
+        setCachedItem(cacheKey, cachedEpisodes, 4 * 60 * 60 * 1000, 'local');
+        console.log(`✅ [Kitsu] episodes downloaded (${Math.min(synCount, 1200)} eps, synthesized ${Date.now() - t1}ms)`);
+        return cachedEpisodes;
+      }
+    } catch (eSyn) {
+      console.warn(`❌ [Kitsu] episode synthesis failed (${eSyn.message})`);
     }
 
     return [];
@@ -1891,36 +1238,6 @@
     return dedupeRequest(cacheKey, async () => {
     const memKey = cacheKey;
 
-    function mapJikanSearch(items) {
-      return (items || []).map(d => {
-        if (d?.mal_id != null) malSourcedIds.add(String(d.mal_id));
-        const cover = d.images?.webp?.large_image_url || d.images?.jpg?.large_image_url || '';
-        return {
-          id: String(d.mal_id),
-          anilist_id: d.mal_id,
-          mal_id: d.mal_id,
-          type: 'anime',
-          title: {
-            english: d.title_english || d.title || 'Untitled',
-            romaji: d.title || 'Untitled',
-            native: d.title_japanese || ''
-          },
-          format: d.type || 'TV',
-          status: d.status === 'Currently Airing' ? 'RELEASING' : (d.status === 'Not yet aired' ? 'NOT_YET_RELEASED' : 'FINISHED'),
-          season: (d.season || 'SUMMER').toUpperCase(),
-          year: d.year || new Date().getFullYear(),
-          average_score: Math.round((d.score || 7.5) * 10),
-          total_eps: d.episodes || 12,
-          cover_image: { extraLarge: cover, large: cover, medium: cover, small: cover },
-          img: cover,
-          poster: cover,
-          banner: cover,
-          banner_image: cover,
-          is_adult: false
-        };
-      });
-    }
-
     function cacheAndReturn(data) {
       if (data && data.results?.length) {
         setCachedItem(cacheKey, data, 15 * 60 * 1000, 'session');
@@ -1946,131 +1263,30 @@
       console.warn('⚠️ [ClientEngine] Kitsu search fast leg failed:', eK.message);
     }
 
-    // 2. Fallback: AniList Search / Browse with Full Filters (better fuzzy
-    // alias matching + full filter power for the heavy-filter cases).
+    // Kitsu is THE search source (CORS-open, key-less, ~100-400ms).
+    // Heavy filters (genres/tags/country/source) degrade gracefully:
+    // kitsuSearchAdvanced applies whatever Kitsu supports (subtype, status,
+    // season/year) and ignores the rest instead of erroring out.
     try {
-      const aniQuery = `
-        query (
-          $page: Int,
-          $perPage: Int,
-          $search: String,
-          $sort: [MediaSort],
-          $format: MediaFormat,
-          $season: MediaSeason,
-          $seasonYear: Int,
-          $status: MediaStatus,
-          $genre_in: [String],
-          $tag_in: [String],
-          $countryOfOrigin: CountryCode,
-          $source: MediaSource,
-          $isAdult: Boolean
-        ) {
-          Page(page: $page, perPage: $perPage) {
-            pageInfo {
-              total
-              currentPage
-              lastPage
-              hasNextPage
-            }
-            media(
-              search: $search,
-              type: ANIME,
-              sort: $sort,
-              format: $format,
-              season: $season,
-              seasonYear: $seasonYear,
-              status: $status,
-              genre_in: $genre_in,
-              tag_in: $tag_in,
-              countryOfOrigin: $countryOfOrigin,
-              source: $source,
-              isAdult: $isAdult
-            ) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              season
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-              isAdult
-            }
-          }
-        }
-      `;
-      const data = await queryAniList(aniQuery, variables);
-      if (data?.Page?.media?.length) {
-        const results = data.Page.media.map(mapAniListToAnimetsu).filter(Boolean);
-        return cacheAndReturn({
-          results,
-          total: data.Page.pageInfo?.total || results.length,
-          last_page: data.Page.pageInfo?.lastPage || 1,
-          current_page: data.Page.pageInfo?.currentPage || page,
-          has_next_page: data.Page.pageInfo?.hasNextPage || false
-        });
+      const t0 = Date.now();
+      const kit = await kitsuSearchAdvanced({
+        query, params, page, perPage, variables,
+        quiet: true
+      });
+      if (kit && kit.results && kit.results.length) {
+        console.log(`✅ [Kitsu] search results downloaded (${kit.results.length} hits${query ? ` for "${query}"` : ''}, ${Date.now() - t0}ms)`);
+        return cacheAndReturn(kit);
       }
-    } catch (eAni) {
-      console.warn('⚠️ [ClientEngine] AniList search failed, falling back to MAL (Jikan):', eAni.message);
+      console.warn(`❌ [Kitsu] search returned no results${query ? ` for "${query}"` : ''} — serving an empty page.`);
+    } catch (eK) {
+      console.warn(`❌ [Kitsu] search failed (${eK.message}) — serving an empty page.`);
     }
 
-    // 3. Fallback: Jikan Anime Search / Browse
-    try {
-      let jikanUrl = `${JIKAN_URL}/anime?page=${page}&limit=${perPage}`;
-      if (query) {
-        jikanUrl += `&q=${encodeURIComponent(query)}`;
-      } else {
-        const rawSort = String(params.sort || 'popularity').toLowerCase();
-        if (rawSort.includes('score') || rawSort.includes('rating') || rawSort === 'average_score') {
-          jikanUrl = `${JIKAN_URL}/top/anime?page=${page}&limit=${perPage}`;
-        } else if (rawSort.includes('trend')) {
-          jikanUrl = `${JIKAN_URL}/top/anime?filter=airing&page=${page}&limit=${perPage}`;
-        } else if (rawSort.includes('date') || rawSort.includes('season')) {
-          jikanUrl = `${JIKAN_URL}/seasons/now?page=${page}&limit=${perPage}`;
-        } else if (rawSort.includes('fav')) {
-          jikanUrl = `${JIKAN_URL}/top/anime?filter=favorite&page=${page}&limit=${perPage}`;
-        } else {
-          jikanUrl = `${JIKAN_URL}/top/anime?filter=bypopularity&page=${page}&limit=${perPage}`;
-        }
-      }
-      if (variables.format) {
-        jikanUrl += `&type=${variables.format.toLowerCase()}`;
-      }
-      if (variables.status) {
-        const jStatus = variables.status === 'RELEASING' ? 'airing' : (variables.status === 'FINISHED' ? 'complete' : 'upcoming');
-        jikanUrl += `&status=${jStatus}`;
-      }
-
-      const jRes = await jikanFetch(jikanUrl, 6000, 2);
-      if (jRes.ok) {
-        const jJson = await jRes.json();
-        if (jJson?.data?.length) {
-          return cacheAndReturn({
-            results: mapJikanSearch(jJson.data),
-            total: jJson.pagination?.items?.total || 100,
-            last_page: jJson.pagination?.last_visible_page || 5,
-            current_page: page,
-            has_next_page: jJson.pagination?.has_next_page || false
-          });
-        }
-      }
-    } catch (e1) {
-      console.warn('⚠️ [ClientEngine] Jikan search failed, falling back to Kitsu:', e1.message);
-    }
-
-    // 4. Kitsu already served the fast leg; nothing else to try.
     return { results: [], total: 0, last_page: 1, current_page: page, has_next_page: false };
     });
   }
 
-  // 8. Weekly Airing Schedule: 13 days of AniList data (AniList Primary + MAL Fallback)
+  // 8. Weekly Airing Schedule: ReAnime airing schedule (Kitsu has no airing dates)
   async function getClientSchedule(targetDate) {
     const memKey = 'schedule_week_v6';
     let weekItems = [];
@@ -2185,262 +1401,29 @@
           }
         }
       } catch (errReanime) {
-        console.warn('⚠️ [ClientEngine] ReAnime schedule failed, falling back to AniList:', errReanime.message);
+        console.warn(`❌ [ReAnime] schedule failed (${errReanime.message}) — no fallback source for airing times.`);
       }
     }
 
     if (!weekItems.length) {
-      // 2. Fallback 1: Batched 13-Day AniList Query
-      try {
-        const now = new Date();
-        const daysAliases = [];
-        const variables = {};
-
-        for (let i = -6; i <= 6; i++) {
-          const d = new Date(now);
-          d.setDate(now.getDate() + i);
-          const startUnix = Math.floor(new Date(d.getFullYear(), d.getMonth(), d.getDate(), 0, 0, 0).getTime() / 1000);
-          const endUnix = startUnix + 86400;
-          const alias = `d_${i < 0 ? 'm' + Math.abs(i) : 'p' + i}`;
-
-          variables[`s_${alias}`] = startUnix;
-          variables[`e_${alias}`] = endUnix;
-
-          daysAliases.push(`
-            ${alias}: Page(page: 1, perPage: 40) {
-              airingSchedules(airingAt_greater: $s_${alias}, airingAt_lesser: $e_${alias}, sort: TIME) {
-                id
-                episode
-                airingAt
-                timeUntilAiring
-                media {
-                  id
-                  idMal
-                  title { english romaji native }
-                  format
-                  type
-                  averageScore
-                  duration
-                  coverImage { extraLarge large medium color }
-                  bannerImage
-                }
-              }
-            }
-          `);
-        }
-
-        const varDefs = Object.keys(variables).map(k => `$${k}: Int`).join(', ');
-        const query = `query GetBatchedSchedule(${varDefs}) { ${daysAliases.join('\n')} }`;
-
-        const data = await queryAniList(query, variables);
-        if (data) {
-          const rawAiring = [];
-          for (const page of Object.values(data)) {
-            if (page?.airingSchedules?.length) {
-              rawAiring.push(...page.airingSchedules);
-            }
-          }
-
-          if (rawAiring.length) {
-            weekItems = rawAiring.map(item => {
-              const m = item.media || {};
-              const hdCover = getHdCover(m.coverImage?.extraLarge || m.coverImage?.large || '');
-              const airDate = new Date(item.airingAt * 1000);
-              return {
-                id: String(m.id),
-                anime_id: String(m.id),
-                anilist_id: m.id,
-                airing_at: item.airingAt * 1000,
-                airing_time: airDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-                airing_ep: item.episode,
-                episode: item.episode,
-                title: {
-                  english: m.title?.english || m.title?.romaji || 'Untitled',
-                  romaji: m.title?.romaji || m.title?.english || 'Untitled',
-                  native: m.title?.native || ''
-                },
-                cover_image: { extraLarge: hdCover, large: hdCover, medium: hdCover, small: hdCover },
-                img: hdCover,
-                poster: hdCover,
-                banner: m.bannerImage || hdCover,
-                banner_image: m.bannerImage || hdCover,
-                format: m.format || 'TV',
-                color: m.coverImage?.color || '#e4ae5d',
-                average_score: m.averageScore || 80,
-                duration: m.duration || 24
-              };
-            });
-
-            memCache.set(memKey, { data: weekItems, exp: Date.now() + 60 * 60 * 1000 });
-            try { localStorage.setItem('animetsu_schedule_cache', JSON.stringify(weekItems)); } catch {}
-          }
-        }
-      } catch (eAni) {
-        console.warn('⚠️ [ClientEngine] AniList batched schedule failed, falling back to MAL (Jikan):', eAni.message);
-      }
+      console.warn('⚠️ [Schedule] ReAnime airing schedule unreachable — serving empty (Kitsu has no airing timestamps).');
+      return [];
     }
 
-    // If AniList succeeded, return the schedule
-    if (weekItems.length) {
-      if (targetDate) {
-        const d = targetDate instanceof Date ? targetDate : new Date(targetDate);
-        if (!isNaN(d.getTime())) {
-          const targetKey = d.toLocaleDateString('en-CA');
-          const dayItems = weekItems.filter(item => {
-            return new Date(item.airing_at).toLocaleDateString('en-CA') === targetKey;
-          });
-          if (dayItems.length) return dayItems;
-        }
-      }
-      return weekItems;
-    }
-
-    // 2. Fallback: Jikan Seasons Now & Airing
-    let rawList = [];
-
-    try {
-      const res = await jikanFetch(`${JIKAN_URL}/seasons/now?limit=25`, 4500, 2);
-      if (res.ok) {
-        const j = await res.json();
-        if (j.data?.length) rawList = j.data;
-      }
-    } catch (e1) {}
-
-    // 2. Fallback: Jikan Top Airing
-    if (!rawList.length) {
-      try {
-        const res = await jikanFetch(`${JIKAN_URL}/top/anime?filter=airing&limit=25`, 4500, 2);
-        if (res.ok) {
-          const j = await res.json();
-          if (j.data?.length) rawList = j.data;
-        }
-      } catch (e2) {}
-    }
-
-    if (!rawList.length) {
-      // Fallback to home trending or popular
-      const home = await getClientHome();
-      const anyHome = home?.seasonal?.length ? home.seasonal : (home?.trending || []);
-      rawList = anyHome.map(item => ({
-        mal_id: item.mal_id || item.id,
-        title: item.title?.romaji || item.title?.english || 'Anime',
-        title_english: item.title?.english,
-        images: { webp: { large_image_url: item.img || item.poster } },
-        episodes: item.total_eps || 12,
-        type: item.format || 'TV',
-        score: (item.average_score || 75) / 10
-      }));
-    }
-
-    // Realistic daily time slots
-    const timeSlots = [
-      { h: 9, m: 0 },
-      { h: 11, m: 30 },
-      { h: 14, m: 0 },
-      { h: 16, m: 30 },
-      { h: 19, m: 0 },
-      { h: 21, m: 30 },
-      { h: 23, m: 0 }
-    ];
-
-    // Distribute across 13 days (-6 to +6 around today)
-    const scheduleItems = [];
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
-
-    for (let dOffset = -6; dOffset <= 6; dOffset++) {
-      const dayDate = new Date(todayStart + dOffset * 86400 * 1000);
-      const dayOfWeek = dayDate.getDay();
-
-      const animeForDay = rawList.filter((_, idx) => (idx % 7) === dayOfWeek);
-      if (!animeForDay.length) {
-        animeForDay.push(...rawList.slice(0, 3));
-      }
-
-      animeForDay.forEach((item, slotIdx) => {
-        if (item.mal_id != null) malSourcedIds.add(String(item.mal_id));
-        const slot = timeSlots[slotIdx % timeSlots.length];
-        const airDate = new Date(dayDate);
-        airDate.setHours(slot.h, slot.m, 0, 0);
-        const airMs = airDate.getTime();
-
-        const img = item.images?.webp?.large_image_url || item.images?.jpg?.large_image_url || '';
-        const baseEp = item.episodes || 12;
-        const airEp = dOffset > 0 ? Math.min(baseEp, 12 + dOffset) : Math.max(1, 12 + dOffset);
-
-        scheduleItems.push({
-          id: String(item.mal_id),
-          anime_id: String(item.mal_id),
-          airing_at: airMs,
-          airing_time: airDate.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' }),
-          airing_ep: airEp,
-          episode: airEp,
-          title: {
-            english: item.title_english || item.title || 'Untitled',
-            romaji: item.title || 'Untitled',
-            native: item.title_japanese || ''
-          },
-          cover_image: { extraLarge: img, large: img, medium: img, small: img },
-          img: img,
-          poster: img,
-          banner: img,
-          banner_image: img,
-          format: item.type || 'TV',
-          color: '#e4ae5d',
-          average_score: Math.round((item.score || 8) * 10),
-          duration: 24
+    // Optional single-day filter for the schedule page
+    if (targetDate) {
+      const d = targetDate instanceof Date ? targetDate : new Date(targetDate);
+      if (!isNaN(d.getTime())) {
+        const targetKey = d.toLocaleDateString('en-CA');
+        const dayItems = weekItems.filter(item => {
+          return new Date(item.airing_at).toLocaleDateString('en-CA') === targetKey;
         });
-      });
+        if (dayItems.length) return dayItems;
+      }
     }
 
-    memCache.set(memKey, { data: scheduleItems, exp: Date.now() + 60 * 60 * 1000 });
-    return scheduleItems;
+    return weekItems;
   }
-
-  function mapAniListToAnimetsu(m) {
-    if (!m) return null;
-    const cover = getHdCover(m.coverImage?.extraLarge || m.coverImage?.large || m.coverImage?.medium || '');
-    const banner = m.bannerImage || cover;
-    const trailerId = typeof m.trailer === 'string' ? m.trailer : (m.trailer?.id || '');
-    const yr = m.seasonYear || m.startDate?.year || new Date().getFullYear();
-
-    return {
-      id: String(m.id),
-      anilist_id: m.id,
-      mal_id: m.idMal || m.mal_id || m.id,
-      type: 'anime',
-      title: {
-        english: m.title?.english || m.title?.romaji || m.title?.native || 'Untitled',
-        romaji: m.title?.romaji || m.title?.english || 'Untitled',
-        native: m.title?.native || ''
-      },
-      format: m.format || 'TV',
-      status: m.status || 'FINISHED',
-      year: yr,
-      season: m.season || 'FALL',
-      average_score: m.averageScore || 70,
-      mean_score: m.averageScore || 70,
-      duration: m.duration || 24,
-      total_eps: m.episodes || 12,
-      genres: m.genres || [],
-      description: (m.description || '').replace(/<[^>]*>?/gm, ''),
-      banner: banner,
-      banner_image: banner,
-      poster: cover,
-      img: cover,
-      cover_image: { extraLarge: cover, large: cover, medium: cover, small: cover },
-      trailer: trailerId,
-      trailer_url: trailerId ? `https://www.youtube.com/watch?v=${trailerId}` : '',
-      trailer_embed: trailerId ? `https://www.youtube-nocookie.com/embed/${trailerId}` : '',
-      is_adult: Boolean(m.isAdult),
-      next_airing_ep: m.nextAiringEpisode ? {
-        airing_at: m.nextAiringEpisode.airingAt,
-        time_until_airing: m.nextAiringEpisode.timeUntilAiring,
-        ep_num: m.nextAiringEpisode.episode
-      } : null
-    };
-  }
-
 
   // Animetsu v1 TMDB Logo Integration
   const TMDB_API_KEY = '3b0fa3c43dea59ff255ee83f04849655';
@@ -2552,8 +1535,7 @@
     );
   }
 
-  // 0. Home Data: AniList Primary + MAL (Jikan v4) Fallback
-  // 9. Client Home: Top Rated, All-Time Popular, This Season, Trending Now, Top Upcoming
+  // 9. Client Home (Kitsu-only): Trending Now, This Season, All-Time Popular, Top Rated, Top Upcoming
   async function getClientHome() {
     const HOME_CACHE_KEY = 'animetsu_home_cache';
     const HOME_TTL = 30 * 60 * 1000; // 30 minutes
@@ -2580,282 +1562,24 @@
 
     const executeHomeFetch = () => dedupeRequest('home_data_fetch', async () => {
 
-    const currentYear = new Date().getFullYear();
-    const currentMonth = new Date().getMonth() + 1;
-    const currentSeason = currentMonth <= 3 ? 'WINTER' : (currentMonth <= 6 ? 'SPRING' : (currentMonth <= 9 ? 'SUMMER' : 'FALL'));
-
-    // Pure Client-Side Fetch: Queries AniList GraphQL directly from user browser (Instant, 0 server delay, zero IP blocks)
-    try {
-      console.log('🌐 [ClientEngine] Fetching AniList Home data directly from browser...');
-      const homeQuery = `
-        query {
-          trending: Page(page: 1, perPage: 15) {
-            media(type: ANIME, status_not: NOT_YET_RELEASED, sort: TRENDING_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              season
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-            }
-          }
-          seasonal: Page(page: 1, perPage: 24) {
-            media(type: ANIME, season: ${currentSeason}, seasonYear: ${currentYear}, status_not: NOT_YET_RELEASED, sort: POPULARITY_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              season
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-            }
-          }
-          popular: Page(page: 1, perPage: 24) {
-            media(type: ANIME, status_not: NOT_YET_RELEASED, sort: POPULARITY_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-            }
-          }
-          top: Page(page: 1, perPage: 24) {
-            media(type: ANIME, status_not: NOT_YET_RELEASED, sort: SCORE_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-            }
-          }
-          movies: Page(page: 1, perPage: 20) {
-            media(type: ANIME, format: MOVIE, status_not: NOT_YET_RELEASED, sort: TRENDING_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              seasonYear
-              averageScore
-              duration
-              episodes
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              trailer { id }
-            }
-          }
-          upcoming: Page(page: 1, perPage: 15) {
-            media(type: ANIME, status: NOT_YET_RELEASED, sort: POPULARITY_DESC) {
-              id
-              idMal
-              title { english romaji native }
-              format
-              status
-              season
-              seasonYear
-              startDate { year month day }
-              averageScore
-              source
-              genres
-              description(asHtml: false)
-              bannerImage
-              coverImage { extraLarge large medium color }
-              studios(isMain: true) { nodes { name } }
-              nextAiringEpisode { airingAt timeUntilAiring episode }
-              trailer { id }
-            }
-          }
+      // ---------------------------------------------------------------
+      // Kitsu is the ONLY home source: five parallel list requests,
+      // ~1s total. (AniList + Jikan home fetches are gone.)
+      // ---------------------------------------------------------------
+      try {
+        console.log('🟣 [Kitsu] fetching Home data (5 sections, parallel)...');
+        const kresult = await kitsuHomeSections();
+        if (kresult && (kresult.top.length || kresult.popular.length || kresult.seasonal.length)) {
+          console.log(`✅ [Kitsu] Home data downloaded (${kresult.trending.length} trending, ${kresult.seasonal.length} seasonal, ${kresult.popular.length} popular)`);
+          await attachClearLogos(kresult.trending.length ? kresult.trending : kresult.popular);
+          setCachedItem(HOME_CACHE_KEY, kresult, HOME_TTL, 'local');
+          try { localStorage.setItem('animetsu_last_home', JSON.stringify(kresult)); } catch {}
+          return kresult;
         }
-      `;
-
-      const aniHome = await queryAniList(homeQuery);
-      if (aniHome?.trending?.media?.length) {
-        const trending = (aniHome.trending.media || []).map(mapAniListToAnimetsu).filter(Boolean).filter(notUpcoming);
-        const seasonal = (aniHome.seasonal?.media || []).map(mapAniListToAnimetsu).filter(Boolean).filter(notUpcoming);
-        const popular = (aniHome.popular?.media || []).map(mapAniListToAnimetsu).filter(Boolean).filter(notUpcoming);
-        const top = (aniHome.top?.media || []).map(mapAniListToAnimetsu).filter(Boolean).filter(notUpcoming);
-        const movies = (aniHome.movies?.media || []).map(mapAniListToAnimetsu).filter(Boolean).filter(notUpcoming);
-        const upcoming = (aniHome.upcoming?.media || []).map(mapAniListToAnimetsu).filter(Boolean);
-
-        const anyList = trending.length ? trending : (seasonal.length ? seasonal : popular);
-        const result = {
-          trending,
-          seasonal: seasonal.length ? seasonal : anyList,
-          popular: popular.length ? popular : anyList,
-          top: top.length ? top : anyList,
-          movies: movies.length ? movies : anyList.filter(x => x.format === 'MOVIE'),
-          upcoming: upcoming.length ? upcoming : anyList.slice(5, 20)
-        };
-
-        if (result.trending.length) {
-          await attachClearLogos(result.trending);
-          setCachedItem(HOME_CACHE_KEY, result, HOME_TTL, 'local');
-          try { localStorage.setItem('animetsu_last_home', JSON.stringify(result)); } catch {}
-          writeBackToServer('home', 'home', result);
-          return result;
-        }
+        console.warn('❌ [Kitsu] Home data came back empty — trying persisted cache.');
+      } catch (eKitsu) {
+        console.warn(`❌ [Kitsu] Home data failed (${eKitsu.message}) — trying persisted cache.`);
       }
-    } catch (err) {
-      console.warn('⚠️ [ClientEngine] AniList Home error, falling back to MAL (Jikan):', err.message);
-    }
-
-    // 2. Fallback: MyAnimeList (Jikan v4)
-    console.log('🔄 [ClientEngine] Fallback to MAL (Jikan) for Home data...');
-    function mapJikanList(items) {
-      return (items || []).map(item => {
-        if (item?.mal_id != null) malSourcedIds.add(String(item.mal_id));
-        const img = item.images?.webp?.large_image_url || item.images?.jpg?.large_image_url || '';
-        const trailerId = item.trailer?.youtube_id || '';
-        return {
-          id: String(item.mal_id),
-          anilist_id: item.mal_id,
-          mal_id: item.mal_id,
-          type: 'anime',
-          title: {
-            english: item.title_english || item.title || 'Untitled',
-            romaji: item.title || 'Untitled',
-            native: item.title_japanese || ''
-          },
-          format: item.type || 'TV',
-          season: (item.season || 'SUMMER').toUpperCase(),
-          year: item.year || new Date().getFullYear(),
-          status: item.status === 'Currently Airing' ? 'RELEASING' : (item.status === 'Not yet aired' ? 'NOT_YET_RELEASED' : 'FINISHED'),
-          average_score: Math.round((item.score || 8) * 10),
-          cover_image: { extraLarge: img, large: img, medium: img, small: img },
-          img: img,
-          poster: img,
-          banner: img,
-          banner_image: img,
-          trailer: trailerId,
-          trailer_url: trailerId ? `https://www.youtube.com/watch?v=${trailerId}` : '',
-          trailer_embed: trailerId ? `https://www.youtube-nocookie.com/embed/${trailerId}` : '',
-          total_eps: item.episodes || 12,
-          duration: 24,
-          genres: (item.genres || []).map(g => g.name),
-          description: item.synopsis || ''
-        };
-      });
-    }
-
-    // Cap the total wall time of the (serialized) Jikan phase: when Jikan is
-    // completely unreachable (blocked wifi + wisp down), bail out to Kitsu
-    // quickly instead of holding the page hostage for minutes. Because all
-    // five categories enqueue at once, each one is raced against the SHARED
-    // remaining budget rather than checked at start time.
-    const jikanHomeDeadline = Date.now() + 22000;
-    async function fetchCategory(jikanUrl, limit = 20) {
-      if (jikanUrl) {
-        const remain = jikanHomeDeadline - Date.now();
-        if (remain <= 0) return [];
-        try {
-          const res = await Promise.race([
-            jikanFetch(jikanUrl, 5500, 2),
-            new Promise((_, rej) => setTimeout(() => rej(new Error('Jikan category window elapsed')), remain))
-          ]);
-          if (res.ok) {
-            const j = await res.json();
-            if (j.data?.length) return mapJikanList(j.data).slice(0, limit);
-          }
-        } catch (e) {}
-      }
-      return [];
-    }
-
-    try {
-      const [top, popular, seasonal, trending, upcoming] = await Promise.all([
-        // Top Anime -> Top Rated MAL
-        fetchCategory(`${JIKAN_URL}/top/anime?limit=24`, 24),
-        // Most Popular Anime -> All-Time Popular MAL
-        fetchCategory(`${JIKAN_URL}/top/anime?filter=bypopularity&limit=24`, 24),
-        // Summer 2026 / This Season -> Currently Airing Seasonal MAL
-        fetchCategory(`${JIKAN_URL}/seasons/now?limit=24`, 24),
-        // Trending Now -> Airing Trending MAL
-        fetchCategory(`${JIKAN_URL}/top/anime?filter=airing&limit=15`, 15),
-        // Top Upcoming -> MAL Top Upcoming
-        fetchCategory(`${JIKAN_URL}/top/anime?filter=upcoming&limit=15`, 15)
-      ]);
-
-      const anyList = (top.length ? top : (popular.length ? popular : seasonal));
-      const result = {
-        top: top.length ? top : anyList,
-        popular: popular.length ? popular : anyList,
-        seasonal: seasonal.length ? seasonal : anyList,
-        trending: trending.length ? trending : anyList.slice(0, 15),
-        upcoming: upcoming.length ? upcoming : anyList.slice(5, 20)
-      };
-
-      if (result.top.length || result.popular.length || result.seasonal.length) {
-        await attachClearLogos(result.trending.length ? result.trending : result.popular);
-        setCachedItem(HOME_CACHE_KEY, result, HOME_TTL, 'local');
-        try { localStorage.setItem('animetsu_last_home', JSON.stringify(result)); } catch {}
-        // Note: Never writeBackToServer for MAL; CDN cache is reserved strictly for pure AniList home data
-        return result;
-      }
-    } catch (err) {
-      console.warn('⚠️ [ClientEngine] Multi-category fetch error:', err.message);
-    }
-
-    // 3. Fallback 2: Kitsu (third independent source; direct -> wisp).
-    try {
-      const [ktop, kpopular, kseasonal, ktrending, kupcoming] = await Promise.all([
-        kitsuList('top', 24), kitsuList('popular', 24), kitsuList('seasonal', 24),
-        kitsuList('trending', 15), kitsuList('upcoming', 15)
-      ]);
-      const kanList = (ktop.length ? ktop : (kpopular.length ? kpopular : kseasonal));
-      const kresult = {
-        top: ktop.length ? ktop : kanList,
-        popular: kpopular.length ? kpopular : kanList,
-        seasonal: kseasonal.length ? kseasonal : kanList,
-        trending: ktrending.length ? ktrending : kanList.slice(0, 15),
-        upcoming: kupcoming.length ? kupcoming : kanList.slice(5, 20)
-      };
-      if (kresult.top.length || kresult.popular.length || kresult.seasonal.length) {
-        console.log('🔄 [ClientEngine] Using Fallback 2 (Kitsu) for Home data.');
-        await attachClearLogos(kresult.trending.length ? kresult.trending : kresult.popular);
-        setCachedItem(HOME_CACHE_KEY, kresult, HOME_TTL, 'local');
-        try { localStorage.setItem('animetsu_last_home', JSON.stringify(kresult)); } catch {}
-        return kresult;
-      }
-    } catch (eKitsu) {
-      console.warn('⚠️ [ClientEngine] Kitsu home fallback failed:', eKitsu.message);
-    }
 
     // Last persisted cache
     try {
@@ -2889,185 +1613,69 @@
     return executeHomeFetch();
   }
 
-  // 10. Recently Updated Episodes: AniList Primary + MAL (Jikan) Fallback
+  // 10. Recently Updated (Kitsu-only): currently-airing anime sorted by
+  // kitsu's updatedAt (rises when new episodes are added) — the one real
+  // "recently added an episode" signal Kitsu exposes.
   async function getClientRecent(page = 1, perPage = 12) {
-    const cacheKey = `animetsu_recent_${page}_${perPage}`;
+    const perPageSafe = Math.min(Math.max(Number(perPage) || 12, 1), 20); // kitsu cap: 20
+    const cacheKey = `animetsu_recent_${page}_${perPageSafe}`;
     const cached = getCachedItem(cacheKey, 'session');
     if (cached && cached.results?.length) return cached;
 
     return dedupeRequest(cacheKey, async () => {
-    const memKey = cacheKey;
-
-    // 1. Primary: AniList Airing Schedules (notYetAired: false, sort: TIME_DESC)
-    try {
-      const aniRecentQuery = `
-        query ($page: Int, $perPage: Int) {
-          Page(page: $page, perPage: $perPage) {
-            pageInfo {
-              currentPage
-              hasNextPage
-              lastPage
-            }
-            airingSchedules(notYetAired: false, sort: TIME_DESC) {
-              id
-              episode
-              airingAt
-              media {
-                id
-                idMal
-                title { english romaji native }
-                status
-                seasonYear
-                coverImage { extraLarge large medium color }
-                bannerImage
-                format
-                type
-                genres
-                duration
-                averageScore
-                description(asHtml: false)
-              }
-            }
-          }
-        }
-      `;
-      const data = await queryAniList(aniRecentQuery, { page: Number(page), perPage: Number(perPage) });
-      if (data?.Page?.airingSchedules?.length) {
-        const results = data.Page.airingSchedules.map((item, idx) => {
-          const m = item.media;
-          if (!m) return null;
-          const hdCover = getHdCover(m.coverImage?.extraLarge || m.coverImage?.large || '');
-          let viewsCount = 0;
-          try {
-            const cached = localStorage.getItem(`animetsu_real_views_${m.id}_${item.episode}`);
-            if (cached !== null) viewsCount = Number(cached) || 0;
-          } catch {}
-          return {
-            id: String(m.id),
-            anilist_id: m.id,
-            mal_id: m.idMal || m.id,
-            type: 'anime',
-            aired_at: item.airingAt ? item.airingAt * 1000 : (Date.now() - idx * 3600000),
-            ep_num: item.episode,
-            ep_name: `Episode ${item.episode}`,
-            title: {
-              romaji: m.title?.romaji || m.title?.english || 'Untitled',
-              english: m.title?.english || m.title?.romaji || 'Untitled',
-              native: m.title?.native || ''
-            },
-            status: m.status || 'RELEASING',
-            is_adult: false,
-            format: m.format || 'TV',
-            year: m.seasonYear || new Date().getFullYear(),
-            cover_image: { extraLarge: hdCover, large: hdCover, medium: hdCover, small: hdCover },
-            img: hdCover,
-            poster: hdCover,
-            banner: m.bannerImage || hdCover,
-            banner_image: m.bannerImage || hdCover,
-            views: viewsCount
-          };
-        }).filter(Boolean);
-
-        if (results.length) {
-          const recentResult = {
-            results,
-            total: 120,
-            current_page: data.Page.pageInfo?.currentPage || Number(page),
-            has_next_page: data.Page.pageInfo?.hasNextPage || false,
-            last_page: data.Page.pageInfo?.lastPage || 10
-          };
-          setCachedItem(cacheKey, recentResult, 10 * 60 * 1000, 'session');
-          return recentResult;
-        }
-      }
-    } catch (eAni) {
-      console.warn('⚠️ [ClientEngine] AniList recent failed, falling back to MAL (Jikan):', eAni.message);
-    }
-
-    // 2. Fallback: Jikan Seasons Now & Airing
-    let recentItems = [];
-
-    try {
-      const res = await jikanFetch(`${JIKAN_URL}/seasons/now?page=${page}&limit=${perPage}`, 4500, 2);
-      if (res.ok) {
-        const json = await res.json();
-        if (json?.data?.length) recentItems = json.data;
-      }
-    } catch (e1) {}
-
-    // 2. Fallback: Jikan Top Airing
-    if (!recentItems.length) {
+      const t0 = Date.now();
+      const offset = (Math.max(Number(page) || 1, 1) - 1) * perPageSafe;
       try {
-        const res = await jikanFetch(`${JIKAN_URL}/top/anime?filter=airing&page=${page}&limit=${perPage}`, 4500, 2);
-        if (res.ok) {
-          const json = await res.json();
-          if (json?.data?.length) recentItems = json.data;
+        // NOTE: kitsu 500s when a filter is combined with sort=-updatedAt,
+        // so we sort by updatedAt alone and filter to airing shows client-side.
+        const json = await kitsuFetch(`/anime?sort=-updatedAt&page[limit]=20&page[offset]=${offset}&include=mappings`, 9000);
+        const allCards = mapKitsuList_(json);
+        let cards = allCards.filter(c => c.status === 'RELEASING');
+        if (!cards.length) cards = allCards.slice(0, perPageSafe);
+        if (!cards.length) {
+          console.warn('❌ [Kitsu] recently-updated list came back empty — serving an empty page.');
+          return { results: [], total: 0, current_page: Number(page), has_next_page: false, last_page: 1 };
         }
-      } catch (e2) {}
-    }
+        cards = cards.slice(0, perPageSafe);
 
-    if (recentItems.length) {
-      const results = recentItems.map((item, idx) => {
-        if (item?.mal_id != null) malSourcedIds.add(String(item.mal_id));
-        const img = item.images?.webp?.large_image_url || item.images?.jpg?.large_image_url || '';
-        let viewsCount = 0;
-        try {
-          const cached = localStorage.getItem(`animetsu_real_views_${item.mal_id}_${epNum}`);
-          if (cached !== null) viewsCount = Number(cached) || 0;
-        } catch {}
-        const airedAt = Date.now() - (idx * 3600 * 1000 * 2) - ((page - 1) * perPage * 3600 * 1000 * 2);
-
-        let epNum = item.episodes;
-        if (!epNum || epNum < 1) {
-          if (item.startDate || item.aired?.from) {
-            const start = new Date(item.startDate || item.aired?.from).getTime();
+        const results = cards.map((card, idx) => {
+          const mint = card.mal_id || card.anilist_id || card.id;
+          if (mint != null) malSourcedIds.add(String(mint));
+          // Latest aired episode estimate: airing shows drop roughly weekly.
+          let epNum = Number(card.total_eps) || 0;
+          if (!epNum || epNum < 1) {
+            const start = new Date(card.start_date || '').getTime();
             if (!isNaN(start)) {
               const weeks = Math.floor((Date.now() - start) / (7 * 86400 * 1000)) + 1;
               if (weeks > 0 && weeks <= 1200) epNum = weeks;
             }
           }
-        }
-        if (!epNum || epNum < 1) epNum = (Number(item.mal_id || idx + 1) % 12) + 1;
+          if (!epNum || epNum < 1) epNum = (Number(mint || idx + 1) % 12) + 1;
+          const airedAt = Date.now() - (idx * 3600 * 1000 * 2) - (((Number(page) || 1) - 1) * perPageSafe * 3600 * 1000 * 2);
+          return {
+            ...card,
+            type: 'anime',
+            aired_at: airedAt,
+            ep_num: epNum,
+            ep_name: `Episode ${epNum}`,
+            is_adult: card.is_adult || false
+          };
+        });
 
-        return {
-          id: String(item.mal_id),
-          anilist_id: item.mal_id,
-          mal_id: item.mal_id,
-          type: 'anime',
-          aired_at: airedAt,
-          ep_num: epNum,
-          ep_name: `Episode ${epNum}`,
-          title: {
-            romaji: item.title || 'Untitled',
-            english: item.title_english || item.title || 'Untitled',
-            native: item.title_japanese || ''
-          },
-          status: 'RELEASING',
-          is_adult: false,
-          format: item.type || 'TV',
-          year: item.year || new Date().getFullYear(),
-          cover_image: { extraLarge: img, large: img, medium: img, small: img },
-          img: img,
-          poster: img,
-          banner: img,
-          banner_image: img,
-          views: viewsCount
+        const recentResult = {
+          results,
+          total: 120,
+          current_page: Number(page),
+          has_next_page: cards.length >= perPageSafe,
+          last_page: 10
         };
-      });
-
-      const result = {
-        results,
-        total: 120,
-        current_page: Number(page),
-        has_next_page: page < 10,
-        last_page: 10
-      };
-
-      setCachedItem(cacheKey, result, 10 * 60 * 1000, 'session');
-      return result;
-    }
-
-    return { results: [], total: 0, current_page: page, has_next_page: false, last_page: 1 };
+        setCachedItem(cacheKey, recentResult, 10 * 60 * 1000, 'session');
+        console.log(`✅ [Kitsu] recently-updated downloaded (${results.length} items, ${Date.now() - t0}ms)`);
+        return recentResult;
+      } catch (eRecent) {
+        console.warn(`❌ [Kitsu] recently-updated failed (${eRecent.message}) — serving an empty page.`);
+        return { results: [], total: 0, current_page: page, has_next_page: false, last_page: 1 };
+      }
     });
   }
 
