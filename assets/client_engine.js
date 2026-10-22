@@ -356,7 +356,7 @@
       // one last try through the wisp tunnel, still respecting the queue.
       if (wispAvailable()) {
         try {
-          const wRes = await wispFetch(url, {}, 10000);
+          const wRes = await wispFetch(url, {}, 14000);
           if (wRes.status === 429) {
             jikanFailUntilByUrl.set(url, Date.now() + 25000);
             throw new Error('Jikan rate limit (429 via wisp)');
