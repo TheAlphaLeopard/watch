@@ -1,20 +1,25 @@
 // =====================================================================
-// WispNet (v2.7) — WISP-ONLY fallback network for Animetsu.
+// WispNet (v2.9) — WISP-ONLY fallback network for Animetsu.
 // =====================================================================
-// Implements the wisp protocol (MercuryWorkshop wisp-protocol v1/v2,
-// https://github.com/MercuryWorkshop/wisp-protocol) through the
-// self-contained epoxy transport from the nano client
-// (assets/epoxy/index.mjs — WASM inlined) to issue plain HTTP(S)
-// requests over a single multiplexed WebSocket.
+// Replicates the proven nanoweb/chemical.js stack exactly:
+//   window.BareMux (assets/baremux/index.js)  -> BareMuxConnection
+//   assets/baremux/worker.js (SharedWorker)   -> holds the transport
+//   assets/libcurl/index.mjs                  -> LibcurlClient (default)
+//   assets/epoxy/index.mjs                    -> Epoxy (optional)
+// Requests go through `BareClient.fetch()` over wisp TCP/WebSocket streams
+// (MercuryWorkshop wisp-protocol).
 //
 // Fallback chain policy: normal fetch() FIRST; wisp ONLY when the first
 // fetch fails at the network/CORS level. No third-party CORS relay
 // services are used — only wisp servers:
 //   1. wss://truffled.lol/wisp/          (primary)
 //   2. wss://wisp.mercurywork.shop/wisp/ (secondary, mercuryworkshop)
-// A server that fails is put on its own cooldown and the next one is
-// tried; when all are down the caller's original error is rethrown so
-// the engine keeps its existing behavior.
+//
+// Resilience: each server runs in its OWN SharedWorker (isolated identity),
+// so a dead connection on one server never poisons the other. When a
+// transport-level failure happens (wisp socket closed / MuxTaskEnded /
+// broken pipe / request timeout), the transport is torn down and rebuilt
+// on a FRESH SharedWorker once, before the server is marked failed.
 //
 // Overrides: localStorage '@animetsu/wisp' or ?wisp=<url> pins a single
 // server. config/wisp.js holds the defaults.
@@ -32,13 +37,19 @@
   const CFG = Object.assign({
     enabled: true,
     wispServers: DEFAULT_SERVERS.slice(),
-    wispServer: null,              // optional single-server pin (is overridden too)
-    transportPath: 'assets/epoxy/index.mjs',
-    timeoutMs: 10000,
-    cooldownMs: 60000,             // base per-server cooldown after a failure
+    wispServer: null,              // optional single-server pin
+    transport: 'libcurl',          // 'libcurl' (nanoweb-proven) or 'epoxy'
+    transportPath: null,           // computed from transport
+    timeoutMs: 15000,
+    cooldownMs: 60000,             // base per-server cooldown after hard failure
     maxCooldownMs: 10 * 60 * 1000, // cooldown growth cap
     debug: false
   }, window.WISP_CONFIG || {});
+
+  const TRANSPORT_PATHS = {
+    libcurl: 'assets/libcurl/index.mjs',
+    epoxy: 'assets/epoxy/index.mjs'
+  };
 
   // Runtime overrides: localStorage pin first, then URL param.
   try {
@@ -46,9 +57,9 @@
     if (saved && /^wss?:\/\//i.test(saved)) CFG.wispServers = [saved];
     const qp = new URLSearchParams(window.location.search || '').get('wisp');
     if (qp && /^wss?:\/\//i.test(qp)) CFG.wispServers = [qp];
-    if (CFG.wispServer && /^wss?:\/\//i.test(CFG.wispServer) && CFG.wispServers[0] !== CFG.wispServer) {
-      CFG.wispServers = [CFG.wispServer];
-    }
+    const tp = new URLSearchParams(window.location.search || '').get('transport');
+    if (tp && TRANSPORT_PATHS[tp]) CFG.transport = tp;
+    if (CFG.wispServer && /^wss?:\/\//i.test(CFG.wispServer)) CFG.wispServers = [CFG.wispServer];
   } catch {}
 
   // Normalize: always an array of sanitized wss/ws URLs (trailing slash kept —
@@ -57,19 +68,11 @@
     .filter(u => typeof u === 'string' && /^wss?:\/\//i.test(u));
   if (SERVERS.length === 0) SERVERS.push.apply(SERVERS, DEFAULT_SERVERS);
 
-  const state = new Map(); // server url -> { transport, ready, bootPromise, fails, failUntil }
+  const state = new Map(); // server url -> { fails, failUntil }
 
   function entryFor(serverUrl) {
     if (!state.has(serverUrl)) {
-      state.set(serverUrl, {
-        url: serverUrl,
-        transport: null,
-        ready: false,
-        booting: false,
-        bootPromise: null,
-        fails: 0,
-        failUntil: 0
-      });
+      state.set(serverUrl, { url: serverUrl, fails: 0, failUntil: 0 });
     }
     return state.get(serverUrl);
   }
@@ -81,7 +84,26 @@
     try { console.warn.apply(console, ['[WispNet]'].concat([].slice.call(arguments))); } catch {}
   }
 
-  function serverCooling(ms) { return Date.now() < (ms && ms.failUntil || 0); }
+  function absRel(p) {
+    try { return new URL(p, document.baseURI).href; } catch { return p; }
+  }
+  function transportPath() {
+    return CFG.transportPath || TRANSPORT_PATHS[CFG.transport] || TRANSPORT_PATHS.libcurl;
+  }
+
+  // ONE SharedWorker for the whole session (exactly like chemical.js in the
+  // nanoweb project). Server switching is done by re-calling setTransport()
+  // on the same connection — the nanoweb-faithful pattern. A single worker
+  // also guarantees bare-mux's internal ping-recovery always keys to the
+  // only worker that exists (its fallback re-reads a global localStorage
+  // path, so one-worker-per-server would cross wires under failure).
+  const GLOBAL_WORKER_PATH = absRel('assets/baremux/worker.js') + '?v=' + (window.WISP_BAREMUX_V || 'v2_9');
+
+  // currentWorkerServer tracks which wisp url the transport inside the
+  // SharedWorker is configured for right now.
+  let gConn = null, gClient = null, gBootPromise = null, gCurrentServer = null;
+
+  function serverCooling(en) { return en && Date.now() < (en.failUntil || 0); }
 
   // Fully down = every configured server is on cooldown.
   function isCoolingDown() {
@@ -89,6 +111,15 @@
     return true;
   }
 
+  function markServerSoftFail(en, err) {
+    // e.g. one slow request (rate-limit backoff on the target, first-wasm
+    // compile). Short pause only — the tunnel itself may be healthy.
+    en.fails++;
+    en.failUntil = Date.now() + 20000;
+    if (CFG.debug || en.fails <= 1) {
+      warn('slow request (' + (err && err.message || err) + '): ' + en.url + ' — soft pause 20s');
+    }
+  }
   function markServerFail(en, err) {
     en.fails++;
     const ms = Math.min(CFG.cooldownMs * Math.pow(2, Math.max(0, en.fails - 1)), CFG.maxCooldownMs);
@@ -102,61 +133,73 @@
     en.failUntil = 0;
   }
 
-  // Boot (or reuse) the epoxy transport for one wisp server. The transport
-  // performs the wisp handshake internally (INFO/CONTINUE per protocol spec).
-  function boot(en) {
-    if (en.transport && en.ready) return Promise.resolve(en.transport);
-    if (en.bootPromise) return en.bootPromise;
-    en.booting = true;
-    en.bootPromise = (async () => {
-      const href = new URL(CFG.transportPath, document.baseURI).href;
-      log('booting epoxy transport for', en.url, '(', href, ')');
-      const mod = await import(href);
-      const TransportCtor = mod.default || mod.EpoxyTransport || mod.LibcurlClient;
-      if (typeof TransportCtor !== 'function') throw new Error('transport module has no default export');
-      const transport = new TransportCtor({ wisp: en.url, redirect_limit: 8 });
-      await transport.init();
-      en.transport = transport;
-      en.ready = true;
-      en.booting = false;
-      log('transport ready for', en.url);
-      return transport;
+  // Errors that mean "the wisp connection itself is dead/broken": rebuilding
+  // the transport on a fresh worker may genuinely fix these.
+  const HARD_CONNECT_RE = /did not open|ERR_CERT|ERR_NAME|handshake|certificate/i;
+
+  function isTransportDead(err) {
+    const m = String(err && err.message || err || '');
+    return /MuxTaskEnded|broken pipe|connection error|WebSocket|timed out|closure invoked/i.test(m);
+  }
+
+  async function loadBareMux() {
+    if (window.BareMux) return;
+    await new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = absRel('assets/baremux/index.js') + '?v=' + (window.WISP_BAREMUX_V || 'v2_9');
+      s.onload = resolve;
+      s.onerror = () => reject(new Error('failed to load baremux client script'));
+      document.head.appendChild(s);
+    });
+    if (!window.BareMux) throw new Error('BareMux did not initialize');
+  }
+
+  // Boot the single SharedWorker + BareClient pair (once per page load).
+  function boot() {
+    if (gClient) return Promise.resolve(gClient);
+    if (gBootPromise) return gBootPromise;
+    gBootPromise = (async () => {
+      await loadBareMux();
+      log('booting bare-mux worker', GLOBAL_WORKER_PATH);
+      gConn = new window.BareMux.BareMuxConnection(GLOBAL_WORKER_PATH);
+      gClient = new window.BareMux.BareClient(GLOBAL_WORKER_PATH);
+      log('bare-mux worker ready');
+      return gClient;
     })().catch(err => {
-      en.bootPromise = null;
-      en.booting = false;
-      markServerFail(en, err);
+      gBootPromise = null;
+      gConn = null;
+      gClient = null;
+      gCurrentServer = null;
       throw err;
     });
-    return en.bootPromise;
+    return gBootPromise;
   }
 
-  function normalizeHeaders(raw) {
-    if (raw instanceof Headers) return raw;
-    const h = new Headers();
-    if (!raw) return h;
-    try {
-      if (Array.isArray(raw)) {
-        if (raw.length && Array.isArray(raw[0])) {
-          for (const kv of raw) { if (Array.isArray(kv) && kv[0]) h.set(String(kv[0]), String(kv[1] == null ? '' : kv[1])); }
-        } else {
-          for (let i = 0; i + 1 < raw.length; i += 2) { if (raw[i]) h.set(String(raw[i]), String(raw[i + 1] == null ? '' : raw[i + 1])); }
-        }
-      } else if (typeof raw === 'object') {
-        for (const k in raw) {
-          if (Object.prototype.hasOwnProperty.call(raw, k) && raw[k] != null) h.set(String(k), String(raw[k]));
-        }
-      }
-    } catch {}
-    return h;
+  // Configure (or re-configure) the transport inside the SharedWorker for a
+  // given wisp server. Switching servers re-runs setTransport on the same
+  // connection — fresh transport instance, fresh wisp WebSocket.
+  async function configure(serverUrl) {
+    const client = await boot();
+    if (gCurrentServer === serverUrl) return client;
+    log('switching transport wisp to', serverUrl);
+    await gConn.setTransport(absRel(transportPath()), [{ wisp: serverUrl }]);
+    gCurrentServer = serverUrl;
+    return client;
   }
 
-  async function wrapWispResponse(out) {
-    if (out instanceof Response) return out;
-    const status = Number(out && out.status) || 0;
-    const headers = normalizeHeaders(out && out.headers);
-    const body = out && out.body != null ? out.body : null;
-    const init = { status, statusText: (out && out.statusText) || '', headers };
-    try { return new Response(body, init); } catch { return new Response(null, init); }
+  // Mark the currently-configured transport as suspect so the next call to
+  // configure() re-runs setTransport (fresh transport + fresh wisp socket).
+  function invalidateCurrent() {
+    gCurrentServer = null;
+  }
+
+  async function rawFetch(client, url, init) {
+    return await client.fetch(String(url), init);
+  }
+
+  // Thin wrapper: a per-request timeout is applied by the caller's loop.
+  function send(client, url, init, ms) {
+    return withTimeout(rawFetch(client, url, init), ms);
   }
 
   function withTimeout(promise, ms) {
@@ -170,43 +213,82 @@
   }
 
   // Issue one HTTP(S) request through the first available wisp server.
-  // Tries each config-specified server in order (skipping cooled-down
-  // ones) and returns a real Response. Throws when all servers are
-  // unavailable or the request itself failed everywhere.
+  // Failover order: configured servers in order (skipping cooled-down ones).
+  // Transport-level failures get ONE same-server rebuild+retry (setTransport
+  // is re-run, giving a fresh transport + wisp WebSocket) before the server
+  // is cooled down and the next server is tried.
   async function fetch(url, init = {}, timeoutMs) {
-    if (!/^(https?:|wisp:\/?\/?)/i.test(String(url || ''))) {
+    if (!/^(https?:|wisp:?\/?\/?)/i.test(String(url || ''))) {
       throw new Error('only absolute http(s) URLs can route through wisp');
     }
-    const ms = Math.max(1000, Number(timeoutMs) || CFG.timeoutMs);
+    const ms = Math.max(3000, Number(timeoutMs) || CFG.timeoutMs);
     const method = (init && init.method || 'GET').toUpperCase();
     const headers = (init && init.headers) || {};
     let body = init && init.body;
     if (body && typeof body === 'object' && typeof body.json !== 'function' &&
-        !(body instanceof Blob) && !(body instanceof ArrayBuffer) && !(body instanceof Uint8Array)) {
+        !(typeof Blob !== 'undefined' && body instanceof Blob) &&
+        !(typeof ArrayBuffer !== 'undefined' && body instanceof ArrayBuffer) &&
+        !(typeof Uint8Array !== 'undefined' && body instanceof Uint8Array)) {
       try { body = JSON.stringify(body); } catch {}
     }
+    const reqInit = { method, body, headers, redirect: 'follow' };
 
     let lastErr = null;
     for (const serverUrl of SERVERS) {
       const en = entryFor(serverUrl);
       if (serverCooling(en)) { lastErr = lastErr || new Error('wisp server cooling down'); continue; }
+
+      let client;
       try {
-        const transport = await boot(en); // dedupes concurrent boots; throws on failure
-        const client = transport.client || transport;
-        let p;
-        if (client && typeof client.fetch === 'function') {
-          // wasm EpoxyClient.fetch(url, {method, body, headers, redirect}) -> real Response
-          p = client.fetch(String(url), { method, body, headers, redirect: 'manual' });
-        } else {
-          // generic transport shape (bare-mux style)
-          p = transport.request(new URL(String(url)), method, body, headers, undefined);
-        }
-        const res = await withTimeout(p, ms);
-        markServerOK(en);
-        return await wrapWispResponse(res);
+        client = await configure(serverUrl);
       } catch (err) {
         lastErr = err;
-        markServerFail(en, err);
+        const msg = String(err && err.message || err);
+        if (HARD_CONNECT_RE.test(msg) && !/wasm/i.test(msg)) {
+          markServerFail(en, err);
+          continue;
+        }
+        // Soft boot-level failure: force a transport rebuild on retry.
+        invalidateCurrent();
+        try {
+          client = await configure(serverUrl);
+        } catch (err2) {
+          lastErr = err2;
+          markServerFail(en, err2);
+          continue;
+        }
+      }
+
+      try {
+        const res = await send(client, url, reqInit, ms);
+        markServerOK(en);
+        return res;
+      } catch (err) {
+        const msg = String(err && err.message || err);
+        log('request failed via', en.url, '-', msg);
+        invalidateCurrent(); // dead transport: force fresh transport before any further use
+
+        if (HARD_CONNECT_RE.test(msg)) { markServerFail(en, err); lastErr = err; continue; }
+
+        // Plain timeout: transport may still be healthy; don't burn a whole
+        // cooldown on one slow response. Short soft pause, next server.
+        if (/\btimed out\b/i.test(msg)) {
+          markServerSoftFail(en, err);
+          lastErr = err;
+          break;
+        }
+
+        // Soft (transport-level) failure: rebuild once and retry.
+        try {
+          log('rebuilding transport for', en.url, 'and retrying');
+          client = await configure(serverUrl);
+          const res2 = await send(client, url, reqInit, ms);
+          markServerOK(en);
+          return res2;
+        } catch (err2) {
+          lastErr = err2;
+          markServerFail(en, err2);
+        }
       }
     }
     throw lastErr || new Error('no wisp servers configured');
@@ -215,7 +297,7 @@
   // Fetch an image/asset through wisp and hand back an object URL for <img src>.
   async function blobObjectURL(url, timeoutMs) {
     try {
-      const res = await fetch(String(url), {}, Math.max(4000, Number(timeoutMs) || 15000));
+      const res = await fetch(String(url), {}, Math.max(4000, Number(timeoutMs) || 20000));
       if (!res.ok) return null;
       const blob = await res.blob();
       return (blob && blob.size) ? URL.createObjectURL(blob) : null;
@@ -227,14 +309,18 @@
     servers: SERVERS,
     fetch: fetch,
     blobObjectURL: blobObjectURL,
-    isReady() { return SERVERS.some(s => { const e = state.get(s); return e && e.ready; }); },
+    isReady() { return SERVERS.some(s => gCurrentServer === s && !!gClient); },
     isCoolingDown: isCoolingDown,
     status() {
       return {
         enabled: !!CFG.enabled,
+        transport: CFG.transport,
+        worker: GLOBAL_WORKER_PATH,
+        currentServer: gCurrentServer,
+        serverCount: SERVERS.length,
         servers: SERVERS.map(u => {
-          const e = state.get(u) || entryFor(u);
-          return { url: u, ready: e.ready, cooling: serverCooling(e), fails: e.fails };
+          const e = entryFor(u);
+          return { url: u, cooling: serverCooling(e), fails: e.fails };
         })
       };
     }
@@ -263,11 +349,41 @@
   }
 
   // -----------------------------------------------------------------
+  // Pre-warm: boot the SharedWorker + libcurl wasm and open the first
+  // available wisp tunnel right after page load so real API calls later
+  // never race the multi-second first compile.
+  // -----------------------------------------------------------------
+  if (CFG.enabled) {
+    const warm = function () {
+      try {
+        const first = SERVERS.find(s => !serverCooling(entryFor(s)));
+        if (!first) return;
+        configure(first).then(async function () {
+          try {
+            // A real lightweight fetch proves the tunnel (wasm compile +
+            // wss connect + TLS) is fully ready before real traffic arrives.
+            const res = await send(gClient, 'https://example.com/', { method: 'GET' }, 12000);
+            if (res && (res.status >= 200 && res.status < 500)) markServerOK(entryFor(first));
+            log('pre-warm complete for', first, 'status', res && res.status);
+          } catch (e) {
+            log('pre-warm probe failed:', e && e.message);
+          }
+        }, function () {});
+      } catch {}
+    };
+    if (document.readyState === 'loading') {
+      window.addEventListener('load', function () { setTimeout(warm, 800); });
+    } else {
+      setTimeout(warm, 800);
+    }
+  }
+
+  // -----------------------------------------------------------------
   // Suppress the harmless "closure invoked after being dropped" errors
   // that the epoxy WASM glue throws when a wisp WebSocket disconnects.
   // They are a teardown artifact of the transport, not real failures.
   // -----------------------------------------------------------------
-  if (typeof window !== 'undefined' && window.addEventListener) {
+  if (window.addEventListener) {
     window.addEventListener('error', function (e) {
       try {
         const msg = (e && (e.message || (e.error && e.error.message))) || '';
