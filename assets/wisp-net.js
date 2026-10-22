@@ -1,5 +1,5 @@
 // =====================================================================
-// WispNet (v2.9) — WISP-ONLY fallback network for Animetsu.
+// WispNet (v2.10) — WISP-ONLY fallback network for Animetsu.
 // =====================================================================
 // Replicates the proven nanoweb/chemical.js stack exactly:
 //   window.BareMux (assets/baremux/index.js)  -> BareMuxConnection
@@ -84,8 +84,33 @@
     try { console.warn.apply(console, ['[WispNet]'].concat([].slice.call(arguments))); } catch {}
   }
 
+  // Asset base: derived from THIS script's own src URL (…/assets/wisp-net.js)
+  // and NOT from document.baseURI. The SPA router navigates client-side to
+  // deep paths (e.g. /watch/watch/anime); resolving relative asset paths via
+  // baseURI on such routes produced 404s and hard-killed both wisp servers
+  // with "Failed to fetch dynamically imported module" — taking every
+  // provider/stream fallback offline. The script tag always carries the
+  // correct site root, so paths derived from it survive any client route.
+  let ASSET_BASE = '';
+  try {
+    const me = (typeof document !== 'undefined' && document.querySelector) ?
+      (document.querySelector('script[src*="wisp-net.js"]') || document.querySelector('script[src*="wisp-net?"]')) : null;
+    if (me && me.src) {
+      const u = new URL(me.src, (typeof location !== 'undefined' ? location.href : 'about:blank'));
+      const clean = String(u.href).split('?')[0].split('#')[0];
+      const idx = clean.toLowerCase().lastIndexOf('/assets/');
+      if (idx > 0) ASSET_BASE = clean.slice(0, idx + 1); // ".../watch/" (site root)
+    }
+  } catch {}
+  if (!ASSET_BASE) {
+    try { ASSET_BASE = new URL('.', document.baseURI).href; } catch { ASSET_BASE = './'; }
+  }
+
   function absRel(p) {
-    try { return new URL(p, document.baseURI).href; } catch { return p; }
+    try {
+      if (/^(https?:)?\/\//i.test(p) || /^(data|blob):/i.test(p)) return p;
+      return new URL(String(p).replace(/^\/+/, ''), ASSET_BASE).href;
+    } catch { return p; }
   }
   function transportPath() {
     return CFG.transportPath || TRANSPORT_PATHS[CFG.transport] || TRANSPORT_PATHS.libcurl;
@@ -248,13 +273,24 @@
           markServerFail(en, err);
           continue;
         }
+        if (/dynamically imported module|failed to import/i.test(msg)) {
+          // Our own asset failed to load (request asset/base-path issue), not
+          // the wisp server's fault. Brief soft pause + try the next server;
+          // hard-cooling here used to take wisp offline for minutes.
+          markServerSoftFail(en, err);
+          continue;
+        }
         // Soft boot-level failure: force a transport rebuild on retry.
         invalidateCurrent();
         try {
           client = await configure(serverUrl);
         } catch (err2) {
           lastErr = err2;
-          markServerFail(en, err2);
+          if (/dynamically imported module|failed to import/i.test(String(err2 && err2.message || err2))) {
+            markServerSoftFail(en, err2);
+          } else {
+            markServerFail(en, err2);
+          }
           continue;
         }
       }
@@ -287,7 +323,11 @@
           return res2;
         } catch (err2) {
           lastErr = err2;
-          markServerFail(en, err2);
+          if (/dynamically imported module|failed to import/i.test(String(err2 && err2.message || err2))) {
+            markServerSoftFail(en, err2);
+          } else {
+            markServerFail(en, err2);
+          }
         }
       }
     }
@@ -295,12 +335,87 @@
   }
 
   // Fetch an image/asset through wisp and hand back an object URL for <img src>.
+  // -----------------------------------------------------------------
+  // Image recovery QUEUE: every recovered image is one HTTP request tunneled
+  // through the single shared wisp WebSocket. Unbounded parallel image
+  // recovery strangles the tunnel (the "wisp is slow" effect), so image jobs
+  // run with a small concurrency cap, a payload size cap, an in-flight/done
+  // memo (identical broken URLs never refetch), and a per-host failure
+  // cooldown. API/data calls always outrank these image jobs.
+  // -----------------------------------------------------------------
+  const IMG_CONCURRENCY = 2;
+  const IMG_MAX_BYTES = 1.5 * 1024 * 1024;   // don't tunnel big payloads
+  const IMG_MEMO_MAX = 240;                  // remembered urls (blob urls kept)
+  const IMG_HOST_FAIL_PAUSE = 5 * 60 * 1000; // per-host skip after repeated fails
+  const imgMemo = new Map();                 // url -> 'FAIL' | blobURL | pendingPromise
+  const imgHostFails = new Map();            // host -> { fails, until }
+  let imgActive = 0;
+  const imgQueue = [];
+
+  function imgHostInfo(raw) {
+    try {
+      const host = new URL(raw).host;
+      const f = imgHostFails.get(host);
+      if (f && f.until && Date.now() < f.until) return null; // host is cooling
+      return { host: host };
+    } catch { return null; }
+  }
+  function imgHostFail(host) {
+    try {
+      const f = imgHostFails.get(host) || { fails: 0, until: 0 };
+      f.fails++;
+      if (f.fails >= 3) { f.fails = 0; f.until = Date.now() + IMG_HOST_FAIL_PAUSE; }
+      imgHostFails.set(host, f);
+    } catch {}
+  }
+  async function imgDoFetch(raw, info) {
+    try {
+      const res = await fetch(raw, {}, 12000);
+      if (!res.ok) throw new Error('wisp image HTTP ' + res.status);
+      const len = Number(res.headers.get('content-length') || 0);
+      if (len > IMG_MAX_BYTES) throw new Error('wisp image too large');
+      const blob = await res.blob();
+      if (!blob || !blob.size || blob.size > IMG_MAX_BYTES) throw new Error('wisp image too large');
+      const f = imgHostFails.get(info.host);
+      if (f) f.fails = 0;
+      return URL.createObjectURL(blob);
+    } catch (e) {
+      imgHostFail(info.host);
+      return null;
+    }
+  }
+  function runImgNext() {
+    while (imgActive < IMG_CONCURRENCY && imgQueue.length) {
+      const job = imgQueue.shift();
+      imgActive++;
+      job().then(() => { imgActive--; runImgNext(); }, () => { imgActive--; runImgNext(); });
+    }
+  }
+  function recoverImg(raw) {
+    let entry = imgMemo.get(raw);
+    if (entry === 'FAIL') return Promise.resolve(null);
+    if (entry) return entry; // pending promise (dedupe identical urls)
+    const info = imgHostInfo(raw);
+    if (!info) { imgMemo.set(raw, 'FAIL'); return Promise.resolve(null); }
+    entry = new Promise(function (resolve) {
+      imgQueue.push(function () {
+        return imgDoFetch(raw, info).then(function (u) { resolve(u); }, function () { resolve(null); });
+      });
+    });
+    imgMemo.set(raw, entry);
+    if (imgMemo.size > IMG_MEMO_MAX) {
+      const firstKey = imgMemo.keys().next().value;
+      if (firstKey !== undefined) imgMemo.delete(firstKey); // drop (no revoke: img may still use it)
+    }
+    runImgNext();
+    return entry;
+  }
   async function blobObjectURL(url, timeoutMs) {
     try {
-      const res = await fetch(String(url), {}, Math.max(4000, Number(timeoutMs) || 20000));
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      return (blob && blob.size) ? URL.createObjectURL(blob) : null;
+      const info = imgHostInfo(url);
+      if (!info) return null;
+      const u = await imgDoFetch(String(url), info);
+      return (u && typeof u === 'string') ? u : null;
     } catch { return null; }
   }
 
@@ -343,7 +458,7 @@
         if (!/^https?:\/\//i.test(raw)) return;
         if ((img.src || '').startsWith('blob:')) return;
         if (img.dataset) img.dataset.wispFb = '1';
-        blobObjectURL(raw).then(function (u) { if (u) { img.src = u; log('image recovered via wisp:', raw); } }).catch(function () {});
+        recoverImg(raw).then(function (u) { if (u) { img.src = u; log('image recovered via wisp:', raw); } }).catch(function () {});
       } catch (_) {}
     }, true);
   }
