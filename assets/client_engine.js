@@ -155,6 +155,22 @@
   const pendingRequests = new Map();
   const originalFetch = window.fetch;
 
+  // The bundled provider client rejects with "provider destroyed" when it is
+  // torn down mid-flight (navigating away while a stream provider is still
+  // booting). This is a benign teardown race — swallow it before it reaches
+  // the console as an uncaught rejection.
+  if (window.addEventListener) {
+    window.addEventListener('unhandledrejection', function (e) {
+      try {
+        const r = e && e.reason;
+        const msg = (r && (r.message || r)) || '';
+        if (/provider destroyed/i.test(String(msg))) {
+          if (e && e.preventDefault) e.preventDefault();
+        }
+      } catch {}
+    });
+  }
+
   // AniList OAuth Callback Handler
   (async function checkOAuthCallback() {
     try {
@@ -271,6 +287,7 @@
   // =====================================================================
   let anilistNetBlockedUntil = 0;   // direct POST failed at network/CORS level
   let anilistHttpFailUntil = 0;    // AniList API itself returned 403/5xx (e.g. "temporarily disabled")
+  let anilistWispFailUntil = 0;    // wisp-probe backoff during AniList outage (wisp retries at most once/min so the tunnel isn't flooded during a downtime)
   const anilistFailUntilBySig = new Map(); // query signature -> retry-not-before ms
   const anizipMissCache = new Map();       // 'a'+id / 'm'+id -> retry-not-before ms (6h)
   const jikanFailUntilByUrl = new Map();   // url -> retry-not-before ms (short)
@@ -457,6 +474,69 @@
       current_page: page,
       has_next_page: results.length === perPage
     };
+  }
+
+  // Advanced Kitsu search for the getClientSearch fast leg. Understands the
+  // same basic parameters as the AniList browse leg (text, sort, format,
+  // season/year, status) and returns the identical page shape. Genre/tag/
+  // country/source filters have no Kitsu equivalent, so they return null and
+  // the caller falls through to AniList instead of serving unfiltered hits.
+  async function kitsuSearchAdvanced(o) {
+    try {
+      const v = o.variables || {};
+      if (v.genre_in || v.tag_in || v.countryOfOrigin || v.source) return null;
+      const perPage = Math.min(o.perPage || 20, 20);
+      const page = Math.max(1, Number(o.page) || 1);
+      const sortRaw = String((o.params && o.params.sort) || '').toLowerCase();
+      const hasQuery = !!(o.query && String(o.query).trim());
+
+      // Determine a season anchor (explicit vars beat the "current" default)
+      const seasons = ['winter', 'spring', 'summer', 'fall'];
+      const now = new Date();
+      const curSeasonLc = seasons[Math.floor((now.getMonth() + 1) % 12 / 3)];
+      const seasonLc = (v.season && String(v.season).toLowerCase()) || null;
+      const yearNum = Number(v.seasonYear) || now.getFullYear();
+
+      let path = null;
+      const COMMON = `include=mappings&page[limit]=${perPage}&page[offset]=${(page - 1) * perPage}`;
+      if (hasQuery) {
+        const order = (sortRaw.includes('score') || sortRaw.includes('rating')) ? 'sort=-averageRating' : 'sort=-userCount';
+        path = `/anime?filter[text]=${encodeURIComponent(o.query.trim())}&${order}&${COMMON}`;
+      } else if (sortRaw.includes('score') || sortRaw.includes('rating') || sortRaw === 'average_score' || sortRaw.includes('top')) {
+        path = `/anime?sort=-averageRating&${COMMON}`;
+      } else if (sortRaw.includes('trend')) {
+        path = `/anime?filter[status]=current&sort=-userCount&${COMMON}`;
+      } else if (sortRaw.includes('date') || sortRaw.includes('season') || v.season || (v.seasonYear && v.seasonYear !== now.getFullYear()) || (v.status === 'RELEASING')) {
+        const fSeason = seasonLc || (v.status === 'RELEASING' ? curSeasonLc : curSeasonLc);
+        path = `/anime?filter[season]=${fSeason}&filter[seasonYear]=${yearNum}&sort=-userCount&${COMMON}`;
+      } else if (v.status === 'NOT_YET_RELEASED' || sortRaw.includes('upcom')) {
+        path = `/anime?filter[status]=upcoming&sort=-userCount&${COMMON}`;
+      } else {
+        // Default browse leg (popularity etc.)
+        path = `/anime?sort=-userCount&${COMMON}`;
+      }
+      if (v.format && !hasQuery) {
+        const sub = String(v.format).toLowerCase();
+        if (['tv', 'movie', 'ova', 'ona', 'special', 'music'].includes(sub)) {
+          path += `&filter[subtype]=${sub}`;
+        } else if (sub === 'tv_short') {
+          path += '&filter[subtype]=tv'; // nearest Kitsu equivalent
+        }
+      }
+      const json = await kitsuFetch(path, 9000);
+      const results = mapKitsuList_(json);
+      const count = (json && json.meta && Number(json.meta.count)) || results.length;
+      return {
+        results,
+        total: count,
+        last_page: page + 3, // harmless cap; offsets keep working past it
+        current_page: page,
+        has_next_page: ((page - 1) * perPage + results.length) < count
+      };
+    } catch (e) {
+      if (o && o.quiet) return null;
+      throw e;
+    }
   }
 
   // Detail fetch by MAL id: mappings lookup (include=item) gives the anime resource.
@@ -825,8 +905,13 @@
     // 2. Wisp tunnel (wisp protocol over a single multiplexed WebSocket —
     //    truffled.lol first, mercurywork.shop second). Bypasses CORS and wifi
     //    filters entirely; WebSocket connects where fetch() cannot.
+    //    During an AniList outage (403/5xx) the probe is rate-limited to
+    //    once per minute so downtime doesn't flood the shared tunnel with
+    //    doomed requests — the "wisp is slow" effect.
     const body = { query, variables };
-    if (wispAvailable()) {
+    const wispProbeAllowed = Date.now() >= anilistWispFailUntil;
+    if (wispAvailable() && wispProbeAllowed) {
+      let wispOutage = false;
       // 2a. POST-mode (native GraphQL endpoint through wisp)
       try {
         const wRes = await wispFetch(ANILIST_URL, {
@@ -841,29 +926,48 @@
             anilistRateLimitedUntil = 0;
             anilistNetBlockedUntil = 0;
             anilistHttpFailUntil = 0;
+            anilistWispFailUntil = 0;
             return wJson.data || null;
           }
         } else if (wRes.status === 429) {
           anilistRateLimitedUntil = Date.now() + 60000;
+        } else if (wRes.status === 403 || wRes.status >= 500) {
+          wispOutage = true; // AniList itself is down; wisp is fine
+        } else if (wRes.status >= 400) {
+          const b = await wRes.text().catch(() => '');
+          if (!b.trim()) wispOutage = true;
         }
       } catch {}
       // 2b. GET-mode (some wisp backends mangle POST bodies; GET never does)
-      try {
-        const wRes = await wispFetch(
-          ANILIST_URL + '?query=' + encodeURIComponent(body.query) +
-          (body.variables ? '&variables=' + encodeURIComponent(JSON.stringify(body.variables)) : ''),
-          {}, 9000
-        );
-        if (wRes.ok) {
-          const wJson = await wRes.json();
-          if (wJson && !wJson.errors && wJson?.data) {
-            anilistRateLimitedUntil = 0;
-            anilistNetBlockedUntil = 0;
-            anilistHttpFailUntil = 0;
-            return wJson.data || null;
+      if (!wispOutage) {
+        try {
+          const wRes = await wispFetch(
+            ANILIST_URL + '?query=' + encodeURIComponent(body.query) +
+            (body.variables ? '&variables=' + encodeURIComponent(JSON.stringify(body.variables)) : ''),
+            {}, 9000
+          );
+          if (wRes.ok) {
+            const wJson = await wRes.json();
+            if (wJson && !wJson.errors && wJson?.data) {
+              anilistRateLimitedUntil = 0;
+              anilistNetBlockedUntil = 0;
+              anilistHttpFailUntil = 0;
+              anilistWispFailUntil = 0;
+              return wJson.data || null;
+            }
+          } else if (wRes.status === 403 || wRes.status >= 500) {
+            wispOutage = true;
           }
-        }
-      } catch {}
+        } catch {}
+      }
+      if (wispOutage) {
+        // Outage confirmed through the tunnel: probe again in 1 minute.
+        if (!anilistHttpFailUntil) anilistHttpFailUntil = Date.now() + 60 * 1000;
+        anilistWispFailUntil = Date.now() + 60 * 1000;
+        console.warn('[ClientEngine] AniList down (probe via wisp got an outage response) — wisp probe paused 60s.');
+        anilistFailUntilBySig.set(sig, Date.now() + 15000);
+        return null;
+      }
     }
 
     anilistFailUntilBySig.set(sig, Date.now() + 15000); // don't re-attempt this exact query for 15s
@@ -1395,8 +1499,10 @@
   }
 
   // Anime Info Fetcher: AniList Primary + MAL (Jikan v4) Fallback
+  // (Non-numeric ids — SPA route artifacts like "watch", "anime" — are
+  // rejected instantly instead of becoming junk ani.zip/Jikan/Kitsu calls.)
   async function getClientAnimeInfo(animeId) {
-    if (!animeId) return null;
+    if (!/^\d+$/.test(String(animeId || ''))) return null;
     const cacheKey = `animetsu_info_${animeId}`;
 
     // 1. Persistent cache check (Memory -> LocalStorage) - 0ms instant load on reload!
@@ -1500,7 +1606,7 @@
   }
 
   async function getClientAnimeEpisodes(animeId) {
-    if (!animeId) return [];
+    if (!/^\d+$/.test(String(animeId || ''))) return [];
     const cacheKey = `animetsu_eps_${animeId}`;
     const cached = getCachedItem(cacheKey, 'local');
     if (cached && Array.isArray(cached) && cached.length) {
@@ -1822,7 +1928,26 @@
       return data;
     }
 
-    // 1. Primary: AniList Search / Browse with Full Filters
+    // 1. FAST LEG: Kitsu. It is CORS-open and key-less, answers in a few
+    // hundred ms, and keeps working when AniList is down (403 outage) and
+    // Jikan is blocked — exactly the environments where the old search felt
+    // broken/slow. With heavy filters (genres/tags/country/source) Kitsu is
+    // skipped so AniList serves the properly-filtered results instead.
+    try {
+      const kit = await kitsuSearchAdvanced({
+        query, params, page, perPage, variables,
+        quiet: true
+      });
+      if (kit && kit.results && kit.results.length) {
+        console.log('🔍 [ClientEngine] Search served by Kitsu (fast leg).');
+        return cacheAndReturn(kit);
+      }
+    } catch (eK) {
+      console.warn('⚠️ [ClientEngine] Kitsu search fast leg failed:', eK.message);
+    }
+
+    // 2. Fallback: AniList Search / Browse with Full Filters (better fuzzy
+    // alias matching + full filter power for the heavy-filter cases).
     try {
       const aniQuery = `
         query (
@@ -1896,7 +2021,7 @@
       console.warn('⚠️ [ClientEngine] AniList search failed, falling back to MAL (Jikan):', eAni.message);
     }
 
-    // 2. Fallback: Jikan Anime Search / Browse
+    // 3. Fallback: Jikan Anime Search / Browse
     try {
       let jikanUrl = `${JIKAN_URL}/anime?page=${page}&limit=${perPage}`;
       if (query) {
@@ -1940,20 +2065,7 @@
       console.warn('⚠️ [ClientEngine] Jikan search failed, falling back to Kitsu:', e1.message);
     }
 
-    // 3. Fallback 2: Kitsu text search (direct -> wisp). Results are keyed by
-    // resolved MAL ids so the rest of the app keeps working unchanged.
-    try {
-      if (query || ['popularity', 'POPULARITY_DESC', 'sf'].includes(String(params.sort || '').toLowerCase())) {
-        const kData = await kitsuSearch(query, page, perPage);
-        if (kData.results?.length) {
-          console.log('🔄 [ClientEngine] Using Fallback 2 (Kitsu) for search.');
-          return cacheAndReturn(kData);
-        }
-      }
-    } catch (eKitsu) {
-      console.warn('⚠️ [ClientEngine] Kitsu search failed:', eKitsu.message);
-    }
-
+    // 4. Kitsu already served the fast leg; nothing else to try.
     return { results: [], total: 0, last_page: 1, current_page: page, has_next_page: false };
     });
   }
