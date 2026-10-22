@@ -133,10 +133,12 @@
  * 
  * Features:
  * 1. Client-Side Data Fetching: Queries open APIs directly from the user's browser (Zero server IP rate limits).
- * 2. Data Architecture:
- *    - Metadata, Search, Browse, Schedule: MyAnimeList / Jikan v4 (https://api.jikan.moe/v4)
+ * 2. Data Architecture (independent providers, tried in order, all with wisp fallback):
+ *    - Primary encyclopedia: AniList GraphQL (https://graphql.anilist.co)
+ *    - Fallback 1: MyAnimeList / Jikan v4 (https://api.jikan.moe/v4)
+ *    - Fallback 2: Kitsu (https://kitsu.io/api/edge) — key-less, CORS-open, resolves
+ *      MAL ids through the kitsu <-> myanimelist mappings so the rest of the site works unchanged
  *    - Episodes & ID Mapping: AniZip (https://api.ani.zip/mappings)
- *    - AniList & Kitsu: Completely disabled / removed
  * 3. Crowdsourced Server Caching:
  *    - When a user fetches fresh data, it silently writes back to the server in the background.
  *    - FINISHED anime: 7 days TTL
@@ -316,6 +318,185 @@
     }
   }
 
+  // =====================================================================
+  // Kitsu provider (v2.10) — third independent anime data source.
+  // https://kitsu.io/api/edge/{JSON:API} — CORS-open, key-less, reliable
+  // even when AniList is down (403 outage) and Jikan is unreachable
+  // (blocked wifi). All calls go direct-first and retry through the wisp
+  // tunnel automatically (streamResilientFetch policy).
+  // Kitsu ids are meaningless to the site (everything resolves MAL/AniList
+  // ids through ani.zip), so every fetched anime is translated through the
+  // kitsu <-> myanimelist/anime mappings include before being used.
+  // =====================================================================
+  const KITSU_URL = 'https://kitsu.io/api/edge';
+
+  async function kitsuFetch(path, timeoutMs = 8000) {
+    const res = await streamResilientFetch(KITSU_URL + path, { accept: 'application/vnd.api+json' }, timeoutMs);
+    if (!res.ok) throw new Error(`Kitsu HTTP ${res.status}`);
+    return await res.json();
+  }
+
+  // Build MAL-id lookup + card mapping from one compound list document.
+  function mapKitsuList_(json) {
+    // relationships: anime.links -> related mapping ids
+    const mappingById = new Map();     // mappingId -> { site, ext }
+    for (const inc of (json.included || [])) {
+      if (inc?.type === 'mappings' && inc?.attributes) {
+        mappingById.set(String(inc.id), {
+          site: String(inc.attributes.externalSite || ''),
+          ext: inc.attributes.externalId
+        });
+      }
+    }
+    const out = [];
+    for (const node of (json.data || [])) {
+      try {
+        if (!node || node.type !== 'anime') continue;
+        const rel = node.relationships?.mappings?.data || [];
+        let malId = null;
+        for (const rv of rel) {
+          const m = mappingById.get(String(rv.id));
+          if (m && m.site === 'myanimelist/anime' && m.ext != null) { malId = Number(m.ext); break; }
+        }
+        if (!malId) continue; // unusable without a MAL handle
+        const a = node.attributes || {};
+        if (/\brx\b|18\+|hentai/i.test(String(a.ageRating || ''))) continue;
+        out.push(mapKitsuAnime(malId, node));
+      } catch { /* skip malformed entry */ }
+    }
+    return out;
+  }
+
+  // Kitsu anime attributes -> Animetsu card shape (same shape Jikan fallback emits).
+  function mapKitsuAnime(malId, node) {
+    const a = node && node.attributes ? node.attributes : (node || {});
+    const poster = a.posterImage?.large || a.posterImage?.original || a.posterImage?.medium || a.posterImage?.tiny || '';
+    const banner = a.coverImage?.large || a.coverImage?.original || a.coverImage?.tiny || poster;
+    const titles = a.titles || {};
+    const en = titles.en || titles.en_us || a.canonicalTitle || '';
+    const romaji = titles.en_jp || titles.en_cnr || titles.en_us || a.canonicalTitle || 'Untitled';
+    const native = titles.ja_jp || '';
+    const status = a.status === 'current' ? 'RELEASING'
+      : (a.status === 'upcoming' || a.status === 'tba' || a.status === 'unreleased') ? 'NOT_YET_RELEASED'
+      : 'FINISHED';
+    const subtypeMap = { tv: 'TV', movie: 'MOVIE', ova: 'OVA', ona: 'ONA', special: 'SPECIAL', music: 'MUSIC' };
+    const fmt = subtypeMap[String(a.subtype || 'tv').toLowerCase()] || 'TV';
+    const score = Math.round(Number(a.averageRating) || 0); // Kitsu rating is already 0-100
+    malSourcedIds.add(String(malId)); // Kitsu resolved this via the MAL mapping — verified for later fallbacks
+    return {
+      id: String(malId),
+      anilist_id: malId,
+      mal_id: malId,
+      kitsu_id: node && node.id ? String(node.id) : '',
+      type: 'anime',
+      title: {
+        english: en || romaji,
+        romaji: romaji,
+        native: native
+      },
+      format: fmt,
+      season: String(a.season || '').toUpperCase() || 'SUMMER',
+      year: Number(String(a.startDate || '').slice(0, 4)) || new Date().getFullYear(),
+      status: status,
+      average_score: score,
+      total_eps: a.episodeCount || 12,
+      duration: a.episodeLength || 24,
+      cover_image: { extraLarge: poster, large: poster, medium: poster, small: poster },
+      img: poster,
+      poster: poster,
+      banner: banner,
+      banner_image: banner,
+      trailer: a.youtubeVideoId || '',
+      trailer_url: a.youtubeVideoId ? `https://www.youtube.com/watch?v=${a.youtubeVideoId}` : '',
+      trailer_embed: a.youtubeVideoId ? `https://www.youtube-nocookie.com/embed/${a.youtubeVideoId}` : '',
+      genres: [],
+      description: a.synopsis || '',
+      popularity: a.userCount || 0,
+      start_date: a.startDate || '',
+      end_date: a.endDate || '',
+      is_adult: /18\+/i.test(String(a.ageRating || ''))
+    };
+  }
+
+  // One paged/sorted Kitsu list request -> Animetsu cards.
+  // NOTE: Kitsu rejects page[limit] > 20 ("Invalid page value", code 118).
+  async function kitsuList(kind_, limit = 20) {
+    limit = Math.min(limit, 20);
+    const now = new Date();
+    const seasons = ['winter', 'spring', 'summer', 'fall'];
+    const curSeason = seasons[Math.floor((now.getMonth() + 1) % 12 / 3)];
+    const curYear = now.getFullYear();
+    let path = '';
+    if (kind_ === 'top') {
+      path = `/anime?sort=-averageRating&page[limit]=${limit}&include=mappings`;
+    } else if (kind_ === 'popular') {
+      path = `/anime?sort=-userCount&page[limit]=${limit}&include=mappings`;
+    } else if (kind_ === 'seasonal') {
+      path = `/anime?filter[season]=${curSeason}&filter[seasonYear]=${curYear}&sort=-userCount&page[limit]=${limit}&include=mappings`;
+    } else if (kind_ === 'trending') {
+      path = `/anime?filter[status]=current&sort=-userCount&page[limit]=${limit}&include=mappings`;
+    } else if (kind_ === 'upcoming') {
+      path = `/anime?filter[status]=upcoming&sort=-userCount&page[limit]=${limit}&include=mappings`;
+    }
+    if (!path) return [];
+    const json = await kitsuFetch(path, 9000);
+    return mapKitsuList_(json).slice(0, limit);
+  }
+
+  // Kitsu text search (used as the third link of getClientSearch).
+  async function kitsuSearch(query, page = 1, perPage = 20) {
+    perPage = Math.min(perPage, 20); // Kitsu hard cap: 20 per page
+    const offset = (page - 1) * perPage;
+    const path = `/anime?filter[text]=${encodeURIComponent(query)}&sort=-userCount&page[limit]=${perPage}&page[offset]=${offset}&include=mappings`;
+    const json = await kitsuFetch(path, 9000);
+    const results = mapKitsuList_(json);
+    return {
+      results,
+      total: results.length * (page + 2),
+      last_page: page + 3,
+      current_page: page,
+      has_next_page: results.length === perPage
+    };
+  }
+
+  // Detail fetch by MAL id: mappings lookup (include=item) gives the anime resource.
+  async function kitsuInfoByMal(malId, anilistId, animeId) {
+    const path = `/mappings?filter[externalSite]=myanimelist/anime&filter[externalId]=${encodeURIComponent(malId)}&include=item`;
+    const json = await kitsuFetch(path, 9000);
+    const mapping = (json.data || [])[0];
+    const an = (json.included || []).find(x => x && x.type === 'anime');
+    if (!an || !an.attributes) throw new Error('Kitsu mapping not found for MAL ' + malId);
+    const cover = an.attributes.posterImage?.large || an.attributes.posterImage?.original || an.attributes.posterImage?.medium || '';
+    const banner = an.attributes.coverImage?.large || an.attributes.coverImage?.original || cover;
+    const info = mapKitsuAnime(malId, an);
+    info.id = String(animeId);                       // keep the caller's original key
+    info.anilist_id = Number(anilistId) || Number(malId);
+    info.banner = banner;
+    info.banner_image = banner;
+    info.cover_image = { extraLarge: cover, large: cover, medium: cover, small: cover };
+    info.rank = (an.attributes.ratingRank && an.attributes.ratingRank <= 100) ? an.attributes.ratingRank : 8;
+    info.seasons = [{
+      id: String(animeId),
+      anilist_id: info.anilist_id,
+      mal_id: malId,
+      title: { english: info.title.english, romaji: info.title.romaji },
+      format: info.format,
+      relation: 'Season 1',
+      relation_type: 'Season 1',
+      cover_image: { large: cover, medium: cover, small: cover },
+      img: cover
+    }];
+    info.characters = [];
+    info.relations = [];
+    info.recommendations = [];
+    info.staff = [];
+    info.studios = [];
+    info.studio = '';
+    info.color = '#e4ae5d';
+    info.description = (an.attributes.synopsis || '').replace(/\[Written by MAL Rewrite\]/g, '').trim();
+    return info;
+  }
+
   // Launch a Jikan request while honouring their 3 req/s & 60 req/min limits.
   // Serialises calls, backs off on 429 and retries timeouts with a longer window.
   function jikanFetch(url, timeoutMs = 6500, attempts = 2) {
@@ -354,9 +535,13 @@
       }
       // All direct attempts failed (blocked network / CORS / timeouts):
       // one last try through the wisp tunnel, still respecting the queue.
+      // Budget scales with the caller's own timeout so bulk home/category
+      // calls (5.5s) degrade fast instead of holding the page hostage for
+      // 14s each; standalone calls (14s budget) keep the full window.
       if (wispAvailable()) {
         try {
-          const wRes = await wispFetch(url, {}, 14000);
+          const wispBudget = Math.min(14000, Math.max(7000, timeoutMs + 3000));
+          const wRes = await wispFetch(url, {}, wispBudget);
           if (wRes.status === 429) {
             jikanFailUntilByUrl.set(url, Date.now() + 25000);
             throw new Error('Jikan rate limit (429 via wisp)');
@@ -1265,6 +1450,31 @@
         console.warn(`⚠️ [ClientEngine] Jikan fallback failed: ${e1.message}`);
       }
 
+      // 2b. Fallback 2: Kitsu detail by MAL id (direct -> wisp)
+      try {
+        const resolvedBefore = await getAnilistIdFromMalId(animeId);
+        let kMalId = null;
+        if (malSourcedIds.has(String(Number(animeId)))) kMalId = Number(animeId);
+        if (!kMalId) {
+          const rz = await resolveAniZipMappings(Number(animeId));
+          if (rz.matchedBy === 'anilist' && Number(rz.malId)) kMalId = Number(rz.malId);
+          else if (rz.matchedBy === 'mal' && Number(rz.malId) === Number(animeId)) kMalId = Number(animeId);
+        }
+        if (kMalId) {
+          console.log(`🔄 [ClientEngine] Trying Fallback 2: Kitsu (MAL: ${kMalId}, AniList: ${animeId})`);
+          const kitsuInfo = await kitsuInfoByMal(kMalId, anilistId, animeId);
+          if (kitsuInfo && kitsuInfo.id) {
+            const isReleasing2 = kitsuInfo.status === 'RELEASING' || kitsuInfo.status === 'NOT_YET_RELEASED';
+            const ttl2 = isReleasing2 ? (2 * 60 * 60 * 1000) : (7 * 24 * 60 * 60 * 1000);
+            setCachedItem(cacheKey, kitsuInfo, ttl2, 'local');
+            // Note: Never writeBackToServer for Kitsu either; CDN cache stays AniList-only.
+            return kitsuInfo;
+          }
+        }
+      } catch (eKitsu) {
+        console.warn(`⚠️ [ClientEngine] Kitsu fallback failed: ${eKitsu.message}`);
+      }
+
       // 3. Stale fallback from persistent storage
       const stale = getStaleCachedItem(cacheKey, 'local');
       if (stale && stale.id) return stale;
@@ -1726,7 +1936,23 @@
           });
         }
       }
-    } catch (e1) {}
+    } catch (e1) {
+      console.warn('⚠️ [ClientEngine] Jikan search failed, falling back to Kitsu:', e1.message);
+    }
+
+    // 3. Fallback 2: Kitsu text search (direct -> wisp). Results are keyed by
+    // resolved MAL ids so the rest of the app keeps working unchanged.
+    try {
+      if (query || ['popularity', 'POPULARITY_DESC', 'sf'].includes(String(params.sort || '').toLowerCase())) {
+        const kData = await kitsuSearch(query, page, perPage);
+        if (kData.results?.length) {
+          console.log('🔄 [ClientEngine] Using Fallback 2 (Kitsu) for search.');
+          return cacheAndReturn(kData);
+        }
+      }
+    } catch (eKitsu) {
+      console.warn('⚠️ [ClientEngine] Kitsu search failed:', eKitsu.message);
+    }
 
     return { results: [], total: 0, last_page: 1, current_page: page, has_next_page: false };
     });
@@ -2436,10 +2662,21 @@
       });
     }
 
+    // Cap the total wall time of the (serialized) Jikan phase: when Jikan is
+    // completely unreachable (blocked wifi + wisp down), bail out to Kitsu
+    // quickly instead of holding the page hostage for minutes. Because all
+    // five categories enqueue at once, each one is raced against the SHARED
+    // remaining budget rather than checked at start time.
+    const jikanHomeDeadline = Date.now() + 22000;
     async function fetchCategory(jikanUrl, limit = 20) {
       if (jikanUrl) {
+        const remain = jikanHomeDeadline - Date.now();
+        if (remain <= 0) return [];
         try {
-          const res = await jikanFetch(jikanUrl, 5500, 2);
+          const res = await Promise.race([
+            jikanFetch(jikanUrl, 5500, 2),
+            new Promise((_, rej) => setTimeout(() => rej(new Error('Jikan category window elapsed')), remain))
+          ]);
           if (res.ok) {
             const j = await res.json();
             if (j.data?.length) return mapJikanList(j.data).slice(0, limit);
@@ -2481,6 +2718,31 @@
       }
     } catch (err) {
       console.warn('⚠️ [ClientEngine] Multi-category fetch error:', err.message);
+    }
+
+    // 3. Fallback 2: Kitsu (third independent source; direct -> wisp).
+    try {
+      const [ktop, kpopular, kseasonal, ktrending, kupcoming] = await Promise.all([
+        kitsuList('top', 24), kitsuList('popular', 24), kitsuList('seasonal', 24),
+        kitsuList('trending', 15), kitsuList('upcoming', 15)
+      ]);
+      const kanList = (ktop.length ? ktop : (kpopular.length ? kpopular : kseasonal));
+      const kresult = {
+        top: ktop.length ? ktop : kanList,
+        popular: kpopular.length ? kpopular : kanList,
+        seasonal: kseasonal.length ? kseasonal : kanList,
+        trending: ktrending.length ? ktrending : kanList.slice(0, 15),
+        upcoming: kupcoming.length ? kupcoming : kanList.slice(5, 20)
+      };
+      if (kresult.top.length || kresult.popular.length || kresult.seasonal.length) {
+        console.log('🔄 [ClientEngine] Using Fallback 2 (Kitsu) for Home data.');
+        await attachClearLogos(kresult.trending.length ? kresult.trending : kresult.popular);
+        setCachedItem(HOME_CACHE_KEY, kresult, HOME_TTL, 'local');
+        try { localStorage.setItem('animetsu_last_home', JSON.stringify(kresult)); } catch {}
+        return kresult;
+      }
+    } catch (eKitsu) {
+      console.warn('⚠️ [ClientEngine] Kitsu home fallback failed:', eKitsu.message);
     }
 
     // Last persisted cache
