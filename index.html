@@ -207,7 +207,7 @@
     <script src="config/wisp.js?v=v2_11"></script>
     <script src="assets/baremux/index.js?v=v2_11"></script>
     <script src="assets/wisp-net.js?v=v2_11"></script>
-    <script src="assets/client_engine.js?v=v2_11"></script>
+    <script src="assets/client_engine.js?v=v2_12"></script>
     <script type="module" crossorigin src="assets/index.js?v=v2_7"></script>
     <script>
       // Universal base detection: works at domain root AND under subpaths
@@ -226,6 +226,10 @@
         } catch (e) {}
         window.__ANIMETSU_BASE__ = base;            // for the SPA router
         window.ANIMETSU_ASSET_BASE = base + "/";    // for JS-injected asset URLs
+        // The stylesheet MUST be written as an absolute path here: the
+        // 404-restore below rewrites the document URL first, and afterwards
+        // a relative <link> would resolve against /anime/... and 404.
+        document.write('<link rel="stylesheet" crossorigin href="' + (base ? base : "") + '/assets/index.css?v=v2_6" />');
         // GitHub Pages 404-redirect recovery: restore the deep-link route
         try {
           var saved = sessionStorage.getItem("animetsu_404_path");
@@ -237,13 +241,21 @@
             }
           }
         } catch (e) {}
+        // Same base shift breaks the boot-loader icon on deep links.
+        document.addEventListener("DOMContentLoaded", function () {
+          try {
+            var img = document.querySelector("#initial-loader img");
+            if (img && img.getAttribute("src") && img.getAttribute("src").indexOf("/") !== 0) {
+              img.src = (base ? base : "") + "/android-chrome-192x192.png";
+            }
+          } catch (e) {}
+        });
       })();
     </script>
-    <link rel="stylesheet" crossorigin href="assets/index.css?v=v2_6" />
     <script>
       // Local-preview guard: explains 404s when this folder is not the server root
       window.addEventListener("load", function () {
-        fetch("manifest.json", { method: "HEAD" })
+        fetch((window.ANIMETSU_ASSET_BASE || "/") + "manifest.json", { method: "HEAD" })
           .then(function (r) {
             if (!r.ok)
               console.warn(
