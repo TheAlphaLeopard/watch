@@ -491,60 +491,121 @@
     };
   }
 
-  // Advanced Kitsu search for the getClientSearch fast leg. Understands the
-  // same basic parameters as the AniList browse leg (text, sort, format,
-  // season/year, status) and returns the identical page shape. Genre/tag/
-  // country/source filters have no Kitsu equivalent, so they return null and
-  // the caller falls through to AniList instead of serving unfiltered hits.
+  // AniList genre names -> Kitsu category slugs (the browse-filter bridge).
+  const ANILIST_GENRE_TO_KITSU = {
+    'action': 'action',
+    'adventure': 'adventure',
+    'comedy': 'comedy',
+    'drama': 'drama',
+    'ecchi': 'ecchi',
+    'fantasy': 'fantasy',
+    'horror': 'horror',
+    'mahou shoujo': 'mahou-shoujo',
+    'mecha': 'mecha',
+    'music': 'music',
+    'mystery': 'mystery',
+    'psychological': 'psychological',
+    'romance': 'romance',
+    'sci-fi': 'science-fiction',
+    'science fiction': 'science-fiction',
+    'slice of life': 'slice-of-life',
+    'sports': 'sports',
+    'supernatural': 'supernatural',
+    'thriller': 'thriller'
+  };
+
+  // Advanced Kitsu search — THE only browse/search implementation now.
+  // Understands every AniList-era browse parameter and translates it:
+  //   text -> filter[text], genres -> filter[categories] (kitsu slugs),
+  //   format -> filter[subtype], status -> filter[status],
+  //   season/year -> filter[season]/filter[seasonYear],
+  //   sort -> -userCount / -averageRating / -startDate.
+  // Tags/country/source have no Kitsu equivalent and are ignored (results
+  // still appear instead of the old "no results found"). All combos were
+  // validated against the live Kitsu API.
   async function kitsuSearchAdvanced(o) {
     try {
       const v = o.variables || {};
-      if (v.genre_in || v.tag_in || v.countryOfOrigin || v.source) return null;
+      const params = o.params || {};
       const perPage = Math.min(o.perPage || 20, 20);
       const page = Math.max(1, Number(o.page) || 1);
-      const sortRaw = String((o.params && o.params.sort) || '').toLowerCase();
+      const sortRaw = String(params.sort || '').toLowerCase();
       const hasQuery = !!(o.query && String(o.query).trim());
 
-      // Determine a season anchor (explicit vars beat the "current" default)
-      const seasons = ['winter', 'spring', 'summer', 'fall'];
-      const now = new Date();
-      const curSeasonLc = seasons[Math.floor((now.getMonth() + 1) % 12 / 3)];
-      const seasonLc = (v.season && String(v.season).toLowerCase()) || null;
-      const yearNum = Number(v.seasonYear) || now.getFullYear();
-
-      let path = null;
-      const COMMON = `include=mappings&page[limit]=${perPage}&page[offset]=${(page - 1) * perPage}`;
+      const parts = ['/anime'];
       if (hasQuery) {
-        const order = (sortRaw.includes('score') || sortRaw.includes('rating')) ? 'sort=-averageRating' : 'sort=-userCount';
-        path = `/anime?filter[text]=${encodeURIComponent(o.query.trim())}&${order}&${COMMON}`;
-      } else if (sortRaw.includes('score') || sortRaw.includes('rating') || sortRaw === 'average_score' || sortRaw.includes('top')) {
-        path = `/anime?sort=-averageRating&${COMMON}`;
-      } else if (sortRaw.includes('trend')) {
-        path = `/anime?filter[status]=current&sort=-userCount&${COMMON}`;
-      } else if (sortRaw.includes('date') || sortRaw.includes('season') || v.season || (v.seasonYear && v.seasonYear !== now.getFullYear()) || (v.status === 'RELEASING')) {
-        const fSeason = seasonLc || (v.status === 'RELEASING' ? curSeasonLc : curSeasonLc);
-        path = `/anime?filter[season]=${fSeason}&filter[seasonYear]=${yearNum}&sort=-userCount&${COMMON}`;
-      } else if (v.status === 'NOT_YET_RELEASED' || sortRaw.includes('upcom')) {
-        path = `/anime?filter[status]=upcoming&sort=-userCount&${COMMON}`;
-      } else {
-        // Default browse leg (popularity etc.)
-        path = `/anime?sort=-userCount&${COMMON}`;
+        parts.push(`filter[text]=${encodeURIComponent(o.query.trim())}`);
       }
-      if (v.format && !hasQuery) {
-        const sub = String(v.format).toLowerCase();
-        if (['tv', 'movie', 'ova', 'ona', 'special', 'music'].includes(sub)) {
-          path += `&filter[subtype]=${sub}`;
-        } else if (sub === 'tv_short') {
-          path += '&filter[subtype]=tv'; // nearest Kitsu equivalent
+
+      // Genres as Kitsu category slugs (Kitsu ANDs multiple categories).
+      let catSlugs = [];
+      const genreList = (v.genre_in || []).map(g => String(g).trim()).filter(Boolean);
+      for (const gRaw of genreList) {
+        const g = gRaw.toLowerCase();
+        let slug = ANILIST_GENRE_TO_KITSU[g];
+        if (!slug && /^[a-z0-9 &-]+$/.test(g)) slug = g.replace(/[^a-z0-9]+/g, '-');
+        if (slug) catSlugs.push(slug);
+      }
+      catSlugs = Array.from(new Set(catSlugs)).slice(0, 3);
+      if (catSlugs.length) parts.push(`filter[categories]=${catSlugs.join(',')}`);
+
+      // Format -> subtype
+      if (v.format) {
+        const f = String(v.format).toLowerCase();
+        if (['tv', 'movie', 'ova', 'ona', 'special', 'music'].includes(f)) {
+          parts.push(`filter[subtype]=${f}`);
+        } else if (f === 'tv_short') {
+          parts.push('filter[subtype]=tv'); // nearest Kitsu equivalent
         }
       }
-      const json = await kitsuFetch(path, 9000);
-      const results = mapKitsuList_(json);
-      const count = (json && json.meta && Number(json.meta.count)) || results.length;
+
+      // Season / year (explicit values only)
+      const seasonsLc = ['winter', 'spring', 'summer', 'fall'];
+      const now = new Date();
+      const seasonLc = (v.season && String(v.season).toLowerCase()) || '';
+      const yearNum = Number(v.seasonYear) || 0;
+      if (seasonLc) parts.push(`filter[season]=${seasonLc}`);
+      if (yearNum) parts.push(`filter[seasonYear]=${yearNum}`);
+
+      // Status when not already narrowed by a season filter
+      if (!seasonLc && !yearNum && v.status) {
+        const stMap = { RELEASING: 'current', FINISHED: 'finished', NOT_YET_RELEASED: 'upcoming' };
+        const stSlug = stMap[String(v.status)];
+        if (stSlug) parts.push('filter[status]=' + stSlug);
+      }
+
+      // Sort
+      let sort = 'sort=-userCount';
+      if (sortRaw.includes('score') || sortRaw.includes('rating')) sort = 'sort=-averageRating';
+      else if (sortRaw.includes('date') || sortRaw.includes('release')) sort = 'sort=-startDate';
+      else if ((sortRaw.includes('trend') || sortRaw.includes('airing')) && !hasQuery && !catSlugs.length && !v.status && !seasonLc && !yearNum) {
+        // "Trending" browse = currently-airing, most popular first
+        parts.push('filter[status]=current');
+      }
+      parts.push(`page[limit]=${perPage}&page[offset]=${(page - 1) * perPage}&include=mappings&${sort}`);
+
+      const json = await kitsuFetch(parts[0] + '?' + parts.slice(1).join('&'), 9000);
+      let results = mapKitsuList_(json);
+      let count = (json && json.meta && Number(json.meta.count)) || 0;
+
+      // Multi-genre intersections can be empty (kitsu ANDs categories) —
+      // relax to the first selected genre before giving up.
+      if (catSlugs.length > 1 && !results.length) {
+        const relaxed = parts
+          .slice(1)
+          .filter(p => !p.startsWith('filter[categories]='))
+          .slice(0, -1); // drop the page/limit/include/sort chunk
+        relaxed.push(`filter[categories]=${catSlugs[0]}`);
+        const j2 = await kitsuFetch('/anime?' + relaxed.join('&') + `&page[limit]=${perPage}&page[offset]=${(page - 1) * perPage}&include=mappings&sort=-userCount`, 9000);
+        results = mapKitsuList_(j2);
+        count = (j2 && j2.meta && Number(j2.meta.count)) || 0;
+        if (results.length) console.log(`✅ [Kitsu] search relaxed multi-genre filter (single: ${catSlugs[0]})`);
+      }
+
       return {
         results,
         total: count,
-        last_page: page + 3, // harmless cap; offsets keep working past it
+        last_page: page + 9, // cosmetic; offsets keep working past it
         current_page: page,
         has_next_page: ((page - 1) * perPage + results.length) < count
       };
@@ -581,6 +642,15 @@
       cover_image: { large: cover, medium: cover, small: cover },
       img: cover
     }];
+
+    // Kitsu has no relations graph — reconstruct the two related panels
+    // Kitsu-only:
+    //   "Related"     -> the FRANCHISE (other seasons, parts, OVAs, spin-offs,
+    //                    compilation movies), rebuilt from title-prefix
+    //                    discovery over a Kitsu text search, classified from
+    //                    each entry's own title + format.
+    //   "More Like This" -> similar shows via category overlap (categories
+    //                    excluded from the franchise list).
     info.characters = [];
     info.relations = [];
     info.recommendations = [];
@@ -588,8 +658,244 @@
     info.studios = [];
     info.studio = '';
     info.color = '#e4ae5d';
+    try {
+      const [relCards, franchise] = await Promise.all([
+        kitsuMoreLikeThis(an.id, malId).catch(() => []),
+        kitsuFranchise(an, malId)
+      ]);
+      const sibs = franchise.filter(c => String(c.mal_id) !== String(malId));
+      const selfStart = String(an.attributes.startDate || '');
+
+      info.relations = sibs.map(c => kitsuCardToRelation(
+        c,
+        kitsuRelationType(c, selfStart)
+      )).slice(0, 30);
+
+      // Season strip = a self entry + every TV/ONA franchise sibling.
+      const tvSibs = sibs
+        .filter(c => ['tv', 'ona'].includes((c.format || '').toLowerCase()) && !/junior high|chimi|parody|spin.?off/i.test(String(c.title?.english || c.title?.romaji || '')));
+      info.seasons = [{
+        id: info.id,
+        anilist_id: info.anilist_id,
+        mal_id: malId,
+        title: { english: info.title.english, romaji: info.title.romaji },
+        format: info.format,
+        relation: 'Season 1',
+        relation_type: 'Season 1',
+        cover_image: { large: cover, medium: cover, small: cover },
+        img: cover
+      }].concat(tvSibs.map(c => ({
+        id: String(c.mal_id),
+        anilist_id: c.anilist_id,
+        mal_id: c.mal_id,
+        title: c.title,
+        format: c.format,
+        relation: kitsuSeasonLabel(String(c.title?.english || c.title?.romaji || '')),
+        relation_type: kitsuSeasonLabel(String(c.title?.english || c.title?.romaji || '')),
+        cover_image: { large: c.poster, medium: c.poster, small: c.poster },
+        img: c.poster
+      })));
+
+      // "More Like This" must list OTHER shows, never franchise siblings.
+      const frIds = new Set(sibs.map(c => String(c.mal_id)));
+      const recs = relCards.filter(c => !frIds.has(String(c.mal_id)));
+      info.recommendations = (recs.length ? recs : relCards).slice(0, 18);
+
+      if (sibs.length) console.log(`✅ [Kitsu] franchise downloaded (${sibs.length} siblings: ${info.title.english || info.title.romaji})`);
+      if (info.recommendations.length) console.log(`✅ [Kitsu] related shows downloaded (${info.recommendations.length}, ${info.title.english || info.title.romaji})`);
+    } catch (eRel) {
+      console.warn(`❌ [Kitsu] related shows failed (${eRel.message})`);
+    }
     info.description = (an.attributes.synopsis || '').replace(/\[Written by MAL Rewrite\]/g, '').trim();
     return info;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Franchise discovery (Kitsu-only "Related"): no relations API exists, so the
+  // franchise family is rebuilt from titles. A Kitsu text search for the base
+  // title returns the whole family; entries that share the franchise title
+  // prefix are siblings. Classification comes from each entry's own title
+  // ("Season 2", "Final Season Part 1") and its format (TV/movie/OVA/OVA...).
+  // ---------------------------------------------------------------------------
+  function kitsuNormTitle(t) {
+    return String(t || '').toLowerCase().replace(/[’'`]/g, '').replace(/[^a-z0-9]+/g, '');
+  }
+
+  function kitsuTitleBases(anNode) {
+    const a = anNode.attributes || {};
+    const raw = [a.titles?.en, a.titles?.en_us, a.titles?.en_jp, a.titles?.en_cnr,
+      a.romajiTitle, a.canonicalTitle, a.romajiTitle];
+    const bases = [];
+    for (const t of raw) {
+      const n = kitsuNormTitle(t);
+      if (n && n.length >= 4 && !bases.includes(n)) bases.push(n);
+    }
+    // "Hunter x Hunter (2011)" — also allow the pre-parenthesis prefix so the
+    // franchise without a disambiguator still matches.
+    const paren = /(.+?)\(/.exec(String(a.titles?.en || a.romajiTitle || ''));
+    if (paren) {
+      const n = kitsuNormTitle(paren[1]);
+      if (n && n.length >= 4 && !bases.includes(n)) bases.push(n);
+    }
+    return bases;
+  }
+
+  // "Attack on Titan The Final Season Part 1" -> "Final Season (Part 1)" etc.
+  function kitsuSeasonLabel(title) {
+    const T = String(title || '');
+    const pm = T.match(/part\s*(\d+)/i);
+    const partSuffix = pm ? ` (Part ${pm[1]})` : '';
+    const sm = T.match(/season\s*(\d+)/i);
+    if (sm) return `Season ${sm[1]}${partSuffix}`;
+    if (/final season/i.test(T)) return `Final Season${partSuffix}`;
+    const rm = T.match(/\b(II|III|IV|V|VI|VII|VIII)\s*$/i);
+    if (rm) {
+      const nums = { II: 2, III: 3, IV: 4, V: 5, VI: 6, VII: 7, VIII: 8 };
+      const n = nums[rm[1].toUpperCase()];
+      if (n) return `Season ${n}${partSuffix}`;
+    }
+    return 'Sequel';
+  }
+
+  // AniList-style edge label so the old relation chips render naturally.
+  function kitsuRelationType(card, selfStart) {
+    const T = String(card.title?.english || card.title?.romaji || '');
+    if (/junior high|chimi|parody|spin.?off/i.test(T)) return 'SPIN_OFF';
+    const f = String(card.format || '').toLowerCase();
+    if (f === 'movie') return /(recap|chronicle|compil)/i.test(T) ? 'SUMMARY' : 'ALTERNATIVE_VERSION';
+    if (f === 'ova' || f === 'special' || f === 'music') return 'SIDE_STORY';
+    const same = String(card.start_date || card.date || '').slice(0, 10);
+    const after = !selfStart || !same ? true : same >= String(selfStart).slice(0, 10);
+    return after ? 'SEQUEL' : 'PREQUEL';
+  }
+
+  async function kitsuFranchise(anNode, selfMalId) {
+    const a = anNode.attributes || {};
+    const bases = kitsuTitleBases(anNode);
+    if (!bases.length) return [];
+    const qTitle = a.romajiTitle || a.titles?.en_jp || a.titles?.en || a.canonicalTitle || '';
+    if (!qTitle) return [];
+
+    const fetchPage = async (offset) => {
+      const path = `/anime?filter[text]=${encodeURIComponent(qTitle)}&sort=-userCount&page[limit]=20&page[offset]=${offset}&include=mappings`;
+      const j = await kitsuFetch(path, 9000);
+      return mapKitsuList_(j);
+    };
+
+    let pool = await fetchPage(0);
+    // Long families (One Piece) can exceed one page — sweep one extra page
+    // when the first page matched heavily at the tail.
+    const matched = pool.filter(kitsuIsSibling);
+    if (matched.length >= 16) {
+      try { pool = pool.concat(await fetchPage(20)); } catch (e) { /* keep page 1 */ }
+    }
+
+    const selfNorm = new Set();
+    [a.titles?.en, a.titles?.en_us, a.titles?.en_jp, a.titles?.en_cnr, a.romajiTitle, a.canonicalTitle]
+      .forEach(t => { const n = kitsuNormTitle(t); if (n) selfNorm.add(n); });
+
+    const seen = new Set([String(selfMalId)]);
+    const sibs = [];
+    for (const card of pool) {
+      const key = String(card.mal_id);
+      if (seen.has(key)) continue;
+      const cn = [kitsuNormTitle(card.title?.english), kitsuNormTitle(card.title?.romaji)]
+        .filter(n => n && !selfNorm.has(n));
+      const isSibling = cn.some(n => bases.some(b => n.startsWith(b) && n !== b));
+      if (!isSibling) continue;
+      seen.add(key);
+      sibs.push(card);
+      if (sibs.length >= 30) break;
+    }
+
+    // Order: TV/ONA seasons first, then OVAs/specials, then movies — each
+    // chronological, matching how the old AniList graph read.
+    const rank = { tv: 0, ona: 1, ova: 2, special: 3, music: 4, movie: 5 };
+    sibs.sort((a, b) => {
+      const ra = rank[String(a.format || 'tv').toLowerCase()] ?? 6;
+      const rb = rank[String(b.format || 'tv').toLowerCase()] ?? 6;
+      if (ra !== rb) return ra - rb;
+      const da = String(a.start_date || a.endDate || ''), db = String(b.start_date || b.endDate || '');
+      if (da !== db) return da < db ? -1 : 1;
+      return (a.year || 0) - (b.year || 0);
+    });
+    return sibs;
+
+    function kitsuIsSibling(card) { // used only for the extra-page sweep check
+      const cn = [kitsuNormTitle(card.title?.english), kitsuNormTitle(card.title?.romaji)].filter(Boolean);
+      return cn.some(n => bases.some(b => n.startsWith(b) && n !== b));
+    }
+  }
+
+  // Related / More-Like-This via Kitsu category overlap. Fetches the anime's
+  // categories, keeps the two most specific safe ones, intersects them, and
+  // widens to the single most specific one when the pool is too small.
+  async function kitsuMoreLikeThis(kitsuId, excludeMalId, opts = {}) {
+    const want = Number(opts.want) || 12;
+    const catJson = await kitsuFetch(`/anime/${kitsuId}/categories?page[limit]=30`, 9000);
+    const cats = (catJson.data || [])
+      .map(c => ({
+        slug: c?.attributes?.slug || '',
+        count: Number(c?.attributes?.totalMediaCount) || 0,
+        nsfw: Boolean(c?.attributes?.nsfw) || /hentai|x-rated/i.test(String(c?.attributes?.title || ''))
+      }))
+      .filter(c => c.slug && !c.nsfw && c.count >= 10 && !['notinmy', 'notagenre'].includes(c.slug));
+    // Most specific first = strongest similarity signal.
+    cats.sort((a, b) => a.count - b.count);
+    const top = cats.slice(0, 3);
+
+    if (!top.length) return [];
+    const gather = async (slugs) => {
+      const path = `/anime?filter[categories]=${slugs.join(',')}&sort=-userCount&page[limit]=20&include=mappings`;
+      const j = await kitsuFetch(path, 9000);
+      const cards = mapKitsuList_(j)
+        .filter(c => String(c.mal_id) !== String(excludeMalId));
+      return { cards, count: Number(j?.meta?.count) || 0 };
+    };
+
+    // Narrow (truest match) -> widen as needed: intersect the two most
+    // specific categories, then fall through single categories and merge
+    // the unique results until the row is filled.
+    const pools = [];
+    if (top.length >= 2) pools.push(top.slice(0, 2).map(c => c.slug));
+    for (const c of top) pools.push([c.slug]);
+
+    const seen = new Set();
+    const merged = [];
+    for (const slugs of pools) {
+      if (merged.length >= want) break;
+      try {
+        const got = await gather(slugs);
+        for (const card of got.cards) {
+          const key = String(card.mal_id);
+          if (seen.has(key)) continue;
+          seen.add(key);
+          merged.push(card);
+        }
+      } catch (e) { /* one bad category must not kill the row */ }
+    }
+    return merged.slice(0, 18);
+  }
+
+  // Kitsu card -> the relations-entry shape the UI bundle expects
+  // (same field set the old AniList normalize emitted + the relation chip).
+  function kitsuCardToRelation(card, relationType) {
+    return {
+      id: String(card.id || card.mal_id),
+      anilist_id: card.anilist_id,
+      mal_id: card.mal_id,
+      kitsu_id: card.kitsu_id || '',
+      relation_type: relationType || 'OTHER',
+      title: card.title,
+      format: card.format,
+      status: card.status,
+      year: card.year,
+      type: 'anime',
+      cover_image: card.cover_image,
+      img: card.poster || card.cover_image?.large || '',
+      poster: card.poster,
+      banner: card.banner || card.poster || ''
+    };
   }
 
   // (Jikan fetch removed — Animetsu is Kitsu-only for all metadata.)
